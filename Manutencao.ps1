@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 # =========================================================
 
 $script:AppName = 'Windows Maintenance Suite Pro'
-$script:Version = '2.4'
+$script:Version = '2.5'
 $script:StartTime = Get-Date
 
 $script:BasePath = Join-Path $env:USERPROFILE 'Documents\MaintenanceSuite'
@@ -276,14 +276,24 @@ function Get-FreeSystemDrivePercent {
 function Get-RecentCriticalEventCount {
     param([int]$Hours = 72)
 
+    # IDs conhecidos como cosméticos — gerados durante inicialização/desligamento
+    # e que não indicam problema real no sistema.
+    $cosmeticIds = @(
+        10005,  # DistributedCOM — serviço não iniciou a tempo
+        10010,  # DistributedCOM — servidor DCOM não registrado
+        7043,   # Service Control Manager — serviço demorou no desligamento
+        7023    # Service Control Manager — serviço encerrou com erro menor
+    )
+
     try {
-        return @(
-            Get-WinEvent -FilterHashtable @{
-                LogName   = 'System'
-                Level     = 1,2
-                StartTime = (Get-Date).AddHours(-$Hours)
-            } -ErrorAction Stop
-        ).Count
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Level     = 1,2
+            StartTime = (Get-Date).AddHours(-$Hours)
+        } -ErrorAction Stop
+
+        # Conta apenas eventos que NÃO são cosméticos conhecidos
+        return @($events | Where-Object { $_.Id -notin $cosmeticIds }).Count
     }
     catch {
         return $null
@@ -455,12 +465,21 @@ function Clear-TemporaryFiles {
         }
     }
 
+    # Verifica se a lixeira tem itens antes de tentar esvaziar,
+    # evitando o WARNING falso quando ela já está vazia.
     try {
-        Clear-RecycleBin -Force -ErrorAction Stop
-        Write-Host 'Lixeira esvaziada.' -ForegroundColor DarkGreen
+        $shell = New-Object -ComObject Shell.Application
+        $itemCount = $shell.Namespace(0xa).Items().Count
+
+        if ($itemCount -gt 0) {
+            Clear-RecycleBin -Force -ErrorAction Stop
+            Write-Host "Lixeira esvaziada ($itemCount item(s) removido(s))." -ForegroundColor DarkGreen
+        } else {
+            Write-Host 'Lixeira já estava vazia.' -ForegroundColor DarkGray
+        }
     }
     catch {
-        Write-Log 'Falha ao limpar lixeira.' 'WARNING'
+        Write-Log 'Falha ao verificar ou limpar lixeira.' 'WARNING'
     }
 
     Write-Host ''
