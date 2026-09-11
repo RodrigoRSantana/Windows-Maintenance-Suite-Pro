@@ -1,31 +1,49 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 param(
     [switch]$Auto,
     [switch]$Advanced,
-    [switch]$ExportReport
+    [switch]$ExportReport,
+    [switch]$HtmlReport,
+    [switch]$InstallTask,
+    [switch]$RemoveTask
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Configurar codificação UTF-8 no console para suporte perfeito a caracteres PT-BR
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
 
 # =========================================================
 # CONFIGURAÇÃO GLOBAL
 # =========================================================
 
 $script:AppName = 'Windows Maintenance Suite Pro'
-$script:Version = '2.5'
+$script:Version = '3.0'
 $script:StartTime = Get-Date
 
 $script:BasePath = Join-Path $env:USERPROFILE 'Documents\MaintenanceSuite'
 $script:LogPath = Join-Path $script:BasePath 'Maintenance.log'
 $script:ReportPath = Join-Path $script:BasePath 'SystemReport.txt'
+$script:HtmlReportPath = Join-Path $script:BasePath 'SystemReport.html'
 $script:LastHealthSummary = $null
 
 New-Item -Path $script:BasePath -ItemType Directory -Force | Out-Null
 
+# IDs de eventos conhecidos como cosméticos (não indicam falha real no sistema)
+$script:CosmeticEventIds = @(
+    10005,  # DistributedCOM — serviço não iniciou a tempo
+    10010,  # DistributedCOM — servidor DCOM não registrado
+    7043,   # Service Control Manager — serviço demorou no desligamento
+    7023    # Service Control Manager — serviço encerrou com erro menor
+)
+
 # =========================================================
-# LOGGING
+# LOGGING & RETENÇÃO
 # =========================================================
 
 function Rotate-Logs {
@@ -37,9 +55,16 @@ function Rotate-Logs {
                 $archive = Join-Path $script:BasePath (
                     'Maintenance_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
                 )
-
                 Move-Item $script:LogPath $archive -Force
             }
+        }
+
+        # Retenção: manter no máximo os 5 logs arquivados mais recentes
+        $archives = Get-ChildItem -Path $script:BasePath -Filter 'Maintenance_*.log' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending
+
+        if ($archives -and $archives.Count -gt 5) {
+            $archives | Select-Object -Skip 5 | Remove-Item -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
@@ -82,7 +107,7 @@ function Write-Log {
 }
 
 # =========================================================
-# SEGURANÇA
+# SEGURANÇA & AUTO-ELEVAÇÃO
 # =========================================================
 
 function Test-Administrator {
@@ -100,15 +125,56 @@ function Test-Administrator {
 }
 
 if (-not (Test-Administrator)) {
-    Write-Host ''
-    Write-Host 'Execute este script como ADMINISTRADOR.' -ForegroundColor Yellow
-    Write-Host ''
-    exit 1
+    if ([Environment]::UserInteractive -and -not $Auto) {
+        Write-Host ''
+        Write-Host 'Este script requer privilégios de Administrador.' -ForegroundColor Yellow
+        Write-Host 'Solicitando elevação via UAC...' -ForegroundColor Cyan
+
+        try {
+            $scriptFile = $MyInvocation.MyCommand.Definition
+            if (-not $scriptFile) { $scriptFile = $PSCommandPath }
+
+            $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptFile`""
+            if ($PSBoundParameters.Count -gt 0) {
+                foreach ($key in $PSBoundParameters.Keys) {
+                    if ($PSBoundParameters[$key] -eq $true) {
+                        $argList += " -$key"
+                    }
+                }
+            }
+
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
+            exit 0
+        }
+        catch {
+            Write-Host 'Falha ao solicitar privilégios de Administrador.' -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host ''
+        Write-Host 'Execute este script como ADMINISTRADOR.' -ForegroundColor Yellow
+        Write-Host ''
+        exit 1
+    }
 }
 
 # =========================================================
 # UTILITÁRIOS
 # =========================================================
+
+function Format-ByteSize {
+    param([long]$Bytes)
+
+    if ($Bytes -ge 1GB) {
+        return "$([math]::Round($Bytes / 1GB, 2)) GB"
+    } elseif ($Bytes -ge 1MB) {
+        return "$([math]::Round($Bytes / 1MB, 2)) MB"
+    } elseif ($Bytes -ge 1KB) {
+        return "$([math]::Round($Bytes / 1KB, 2)) KB"
+    } else {
+        return "$Bytes Bytes"
+    }
+}
 
 function Pause-Console {
     if (-not $Auto) {
@@ -167,9 +233,53 @@ function Format-Section {
 }
 
 # ----------------------------------------------------------
+# Read-ProcessOutputFile
+# Lê arquivos de saída temporários detectando dinamicamente
+# a codificação (UTF-16LE sem BOM do SFC, UTF-8 ou OEM/ANSI do DISM).
+# Elimina caracteres corrompidos e linhas com espaços.
+# ----------------------------------------------------------
+function Read-ProcessOutputFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) { return @() }
+
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
+
+        # UTF-16LE com BOM (FF FE) ou sem BOM (comum no sfc.exe com bytes nulos intermediários)
+        $isUtf16Le = ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+                     ($bytes.Length -ge 4 -and $bytes[1] -eq 0x00 -and $bytes[3] -eq 0x00)
+
+        if ($isUtf16Le) {
+            return [System.Text.Encoding]::Unicode.GetString($bytes) -split "\r?\n"
+        }
+
+        # UTF-8 com BOM (EF BB BF)
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) -split "\r?\n"
+        }
+
+        # UTF-8 estrito ou fallback para o OEM da máquina
+        try {
+            $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+            return $utf8Strict.GetString($bytes) -split "\r?\n"
+        }
+        catch {
+            $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+            return [System.Text.Encoding]::GetEncoding($oemCodePage).GetString($bytes) -split "\r?\n"
+        }
+    }
+    catch {
+        return @()
+    }
+}
+
+# ----------------------------------------------------------
 # Invoke-SafeCommand
-# Uso geral: captura output via operador & (funciona para a
-# maioria dos executáveis que escrevem no pipeline padrão).
 # ----------------------------------------------------------
 function Invoke-SafeCommand {
     param(
@@ -199,12 +309,7 @@ function Invoke-SafeCommand {
 
 # ----------------------------------------------------------
 # Invoke-ConsoleCommand
-# Uso específico para DISM e SFC: esses processos escrevem
-# diretamente no buffer do console em UTF-16, o que impede
-# o operador & de capturar o output. A solução é redirecionar
-# stdout e stderr para arquivos temporários, depois ler,
-# exibir e gravar no log. Os temporários são sempre apagados
-# ao final, mesmo em caso de erro.
+# Uso específico para DISM e SFC com decodificação resiliente.
 # ----------------------------------------------------------
 function Invoke-ConsoleCommand {
     param(
@@ -227,8 +332,8 @@ function Invoke-ConsoleCommand {
             -RedirectStandardOutput $tmpOut `
             -RedirectStandardError  $tmpErr
 
-        # Exibe e grava no log cada linha do stdout
-        foreach ($line in (Get-Content $tmpOut -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        # Exibe e grava no log cada linha do stdout decodificada corretamente
+        foreach ($line in (Read-ProcessOutputFile -Path $tmpOut)) {
             $text = $line.TrimEnd()
             if ($text -ne '') {
                 Write-Log $text
@@ -236,7 +341,7 @@ function Invoke-ConsoleCommand {
         }
 
         # Exibe e grava no log cada linha do stderr como WARNING
-        foreach ($line in (Get-Content $tmpErr -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Read-ProcessOutputFile -Path $tmpErr)) {
             $text = $line.TrimEnd()
             if ($text -ne '') {
                 Write-Log $text 'WARNING'
@@ -250,8 +355,114 @@ function Invoke-ConsoleCommand {
         return -1
     }
     finally {
-        # Garante remoção dos temporários independente de erro
         Remove-Item $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =========================================================
+# REINICIALIZAÇÃO PENDENTE
+# =========================================================
+
+function Test-PendingReboot {
+    $reboot = $false
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    # Component Based Servicing
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $reboot = $true
+        $reasons.Add('Component Based Servicing (Atualização do Windows)')
+    }
+
+    # Windows Update
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $reboot = $true
+        $reasons.Add('Windows Update (Reinicialização requerida)')
+    }
+
+    # Pending File Rename
+    try {
+        $rename = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($null -ne $rename -and $rename.Length -gt 0) {
+            $reboot = $true
+            $reasons.Add('Arquivos de sistema aguardando reinicialização para substituição')
+        }
+    }
+    catch {}
+
+    [PSCustomObject]@{
+        IsPending = $reboot
+        Reasons   = @($reasons)
+    }
+}
+
+# =========================================================
+# SAÚDE DA BATERIA (NOTEBOOK)
+# =========================================================
+
+function Get-BatteryHealth {
+    try {
+        $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+        if (-not $battery) { return $null }
+
+        $xmlPath = Join-Path $env:TEMP ("battery_diag_" + [System.Guid]::NewGuid().ToString('N') + ".xml")
+        
+        & powercfg.exe /batteryreport /output "$xmlPath" /xml 2>&1 | Out-Null
+
+        if (Test-Path $xmlPath) {
+            [xml]$xml = Get-Content $xmlPath -ErrorAction Stop
+            Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+            $batNode = $xml.BatteryReport.Batteries.Battery
+            if ($batNode) {
+                $design = [long]$batNode.DesignCapacity
+                $full   = [long]$batNode.FullChargeCapacity
+                $cycle  = [int]$batNode.CycleCount
+
+                $wear = if ($design -gt 0 -and $full -le $design) {
+                    [math]::Round((1 - ($full / $design)) * 100, 1)
+                } else { 0 }
+
+                return [PSCustomObject]@{
+                    HasBattery             = $true
+                    DeviceName             = "$($batNode.Manufacturer)"
+                    Chemistry              = "$($batNode.Chemistry)"
+                    DesignCapacityMWh      = $design
+                    FullChargeCapacityMWh  = $full
+                    CycleCount             = $cycle
+                    WearPercent            = $wear
+                    Status                 = "$($battery.Status)"
+                    EstimatedChargePercent = $battery.EstimatedChargeRemaining
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "Diagnóstico de bateria não disponível: $_" 'INFO' -Silent
+    }
+    finally {
+        if ($xmlPath -and (Test-Path $xmlPath)) {
+            Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $null
+}
+
+function Show-BatteryStatus {
+    Show-SectionTitle -Title 'SAÚDE DA BATERIA (NOTEBOOK)'
+
+    $bat = Get-BatteryHealth
+    if ($bat) {
+        Write-Host "Dispositivo        : Notebook com Bateria ($($bat.Chemistry))" -ForegroundColor Green
+        Write-Host "Carga Atual        : $($bat.EstimatedChargePercent)%"
+        Write-Host "Capacidade Projeto : $($bat.DesignCapacityMWh) mWh"
+        Write-Host "Capacidade Atual   : $($bat.FullChargeCapacityMWh) mWh"
+        Write-Host "Ciclos de Carga    : $($bat.CycleCount)"
+        
+        $wearColor = if ($bat.WearPercent -ge 30) { 'Red' } elseif ($bat.WearPercent -ge 15) { 'Yellow' } else { 'DarkGreen' }
+        Write-Host "Desgaste da Bateria: $($bat.WearPercent)%" -ForegroundColor $wearColor
+    } else {
+        Write-Host 'Bateria não detectada no sistema (Dispositivo Desktop ou sem suporte ACPI).' -ForegroundColor DarkGray
     }
 }
 
@@ -276,15 +487,6 @@ function Get-FreeSystemDrivePercent {
 function Get-RecentCriticalEventCount {
     param([int]$Hours = 72)
 
-    # IDs conhecidos como cosméticos — gerados durante inicialização/desligamento
-    # e que não indicam problema real no sistema.
-    $cosmeticIds = @(
-        10005,  # DistributedCOM — serviço não iniciou a tempo
-        10010,  # DistributedCOM — servidor DCOM não registrado
-        7043,   # Service Control Manager — serviço demorou no desligamento
-        7023    # Service Control Manager — serviço encerrou com erro menor
-    )
-
     try {
         $events = Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
@@ -292,8 +494,7 @@ function Get-RecentCriticalEventCount {
             StartTime = (Get-Date).AddHours(-$Hours)
         } -ErrorAction Stop
 
-        # Conta apenas eventos que NÃO são cosméticos conhecidos
-        return @($events | Where-Object { $_.Id -notin $cosmeticIds }).Count
+        return @($events | Where-Object { $_.Id -notin $script:CosmeticEventIds }).Count
     }
     catch {
         return $null
@@ -313,6 +514,7 @@ function Get-SystemHealth {
 
     $freeSystemDrivePct = Get-FreeSystemDrivePercent
     $criticalEvents72h  = Get-RecentCriticalEventCount -Hours 72
+    $pendingReboot      = Test-PendingReboot
 
     $score = 100
     $notes = New-Object System.Collections.Generic.List[string]
@@ -335,19 +537,45 @@ function Get-SystemHealth {
         }
     }
 
+    # Análise de quedas / desligamentos anormais específicos (Kernel-Power 41 / BSOD 1001)
+    $unexpectedShutdowns = 0
+    try {
+        $unexpectedEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Id        = 41, 6008, 1001
+            StartTime = (Get-Date).AddHours(-72)
+        } -ErrorAction SilentlyContinue
+        if ($unexpectedEvents) {
+            $unexpectedShutdowns = @($unexpectedEvents).Count
+        }
+    }
+    catch {}
+
+    if ($unexpectedShutdowns -gt 0) {
+        $score -= [math]::Min(20, $unexpectedShutdowns * 5)
+        $notes.Add("Quedas de energia ou desligamentos anormais detectados recentemente ($unexpectedShutdowns ocorrência(s)).")
+    }
+
     if ($null -ne $criticalEvents72h) {
         if ($criticalEvents72h -ge 15) {
-            $score -= 25
-            $notes.Add('Muitos eventos críticos/erros recentes no Windows.')
+            $score -= 20
+            $notes.Add('Múltiplos eventos de erro recentes no log do Windows.')
         } elseif ($criticalEvents72h -ge 5) {
             $score -= 10
-            $notes.Add('Há eventos críticos/erros recentes no Windows.')
+            $notes.Add('Há eventos de erro recentes no log do Windows.')
         }
+    }
+
+    if ($pendingReboot.IsPending) {
+        $score -= 5
+        $notes.Add("Reinicialização pendente detectada no Windows ($($pendingReboot.Reasons -join '; ')).")
     }
 
     if ($uptime.TotalDays -lt 1) {
         $notes.Add('Sistema reiniciado recentemente.')
     }
+
+    if ($score -lt 0) { $score = 0 }
 
     if ($score -ge 85) {
         $status = 'BOM'
@@ -372,6 +600,8 @@ function Get-SystemHealth {
         RamUsedPercent         = $ramUsedPct
         FreeSystemDrivePercent = $freeSystemDrivePct
         CriticalEvents72h      = $criticalEvents72h
+        UnexpectedShutdowns    = $unexpectedShutdowns
+        PendingReboot          = $pendingReboot
         Notes                  = @($notes)
     }
 }
@@ -401,6 +631,10 @@ function Show-HealthSummary {
         Write-Host 'Eventos críticos 72h   : não disponível'
     }
 
+    if ($Health.PendingReboot.IsPending) {
+        Write-Host 'Reinicialização pendente : SIM (recomendado reiniciar)' -ForegroundColor Yellow
+    }
+
     if ($Health.Notes.Count -gt 0) {
         Write-Host ''
         Write-Host 'Observações:' -ForegroundColor Cyan
@@ -411,7 +645,7 @@ function Show-HealthSummary {
 }
 
 # =========================================================
-# LIMPEZA SEGURA
+# LIMPEZA SEGURA COM CONTABILIZAÇÃO DE ESPAÇO
 # =========================================================
 
 function Remove-OldFiles {
@@ -422,51 +656,106 @@ function Remove-OldFiles {
         [int]$OlderThanDays = 2
     )
 
-    if (-not (Test-Path $Path)) { return }
+    if (-not (Test-Path $Path)) { return 0 }
 
     $limit = (Get-Date).AddDays(-$OlderThanDays)
+    [long]$freedBytes = 0
 
     try {
         $items = Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue |
                  Where-Object { $_.LastWriteTime -lt $limit }
     }
     catch {
-        Write-Log "Falha ao listar arquivos em $Path" 'WARNING' -Silent
-        return
+        Write-Log "Falha ao listar arquivos em $($Path): $_" 'WARNING' -Silent
+        return 0
     }
 
     if ($null -ne $items) {
         foreach ($item in $items) {
             try {
+                $itemSize = 0
+                if ($item.PSIsContainer) {
+                    $subFiles = Get-ChildItem -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue |
+                                Where-Object { -not $_.PSIsContainer }
+                    if ($subFiles) {
+                        $itemSize = ($subFiles | Measure-Object -Property Length -Sum).Sum
+                    }
+                } else {
+                    $itemSize = $item.Length
+                }
+
                 Remove-Item $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $item.FullName)) {
+                    if ($itemSize -gt 0) { $freedBytes += $itemSize }
+                }
             }
             catch {
                 Write-Log "Falha ao remover item: $($item.FullName)" 'WARNING' -Silent
             }
         }
     }
+
+    return $freedBytes
 }
 
 function Clear-TemporaryFiles {
-    Show-SectionTitle -Title 'LIMPEZA SEGURA DE TEMPORÁRIOS'
+    Show-SectionTitle -Title 'LIMPEZA SEGURA DE TEMPORÁRIOS E CACHE'
 
-    $paths = @(
-        $env:TEMP,
-        "$env:SystemRoot\Temp"
+    [long]$totalFreed = 0
+
+    # 1. Temporários do Usuário e Sistema (> 48 horas)
+    $tempTargets = @(
+        @{ Path = $env:TEMP; Days = 2; Label = 'Temporários do Usuário' },
+        @{ Path = "$env:SystemRoot\Temp"; Days = 2; Label = 'Temporários do Sistema (Windows)' }
     )
 
-    foreach ($path in $paths) {
-        if (Test-Path $path) {
-            Write-Host "Limpando: $path" -ForegroundColor Green
-            Remove-OldFiles -Path $path -OlderThanDays 2
-            Write-Host 'OK' -ForegroundColor DarkGreen
-        } else {
-            Write-Log "Caminho temporário não encontrado: $path" 'WARNING' -Silent
+    foreach ($target in $tempTargets) {
+        if (Test-Path $target.Path) {
+            Write-Host "Limpando: $($target.Label) ($($target.Path))..." -ForegroundColor Green
+            $freed = Remove-OldFiles -Path $target.Path -OlderThanDays $target.Days
+            $totalFreed += $freed
+            Write-Host "OK ($([math]::Round($freed / 1MB, 2)) MB liberados)" -ForegroundColor DarkGreen
         }
     }
 
-    # Verifica se a lixeira tem itens antes de tentar esvaziar,
-    # evitando o WARNING falso quando ela já está vazia.
+    # 2. Cache de downloads do Windows Update (> 7 dias)
+    $wuDownload = "$env:SystemRoot\SoftwareDistribution\Download"
+    if (Test-Path $wuDownload) {
+        Write-Host "Limpando: Cache de downloads do Windows Update..." -ForegroundColor Green
+        $freedWU = Remove-OldFiles -Path $wuDownload -OlderThanDays 7
+        $totalFreed += $freedWU
+        Write-Host "OK ($([math]::Round($freedWU / 1MB, 2)) MB liberados)" -ForegroundColor DarkGreen
+    }
+
+    # 3. Crash Dumps de aplicativos (> 7 dias)
+    $crashDumps = "$env:LOCALAPPDATA\CrashDumps"
+    if (Test-Path $crashDumps) {
+        Write-Host "Limpando: Dumps de travamento de aplicativos..." -ForegroundColor Green
+        $freedCrash = Remove-OldFiles -Path $crashDumps -OlderThanDays 7
+        $totalFreed += $freedCrash
+        Write-Host "OK ($([math]::Round($freedCrash / 1MB, 2)) MB liberados)" -ForegroundColor DarkGreen
+    }
+
+    # 4. Relatórios de erro do Windows (WER)
+    $werArchive = "$env:ProgramData\Microsoft\Windows\WER\ReportArchive"
+    $werQueue   = "$env:ProgramData\Microsoft\Windows\WER\ReportQueue"
+    foreach ($wer in @($werArchive, $werQueue)) {
+        if (Test-Path $wer) {
+            $freedWer = Remove-OldFiles -Path $wer -OlderThanDays 7
+            $totalFreed += $freedWer
+        }
+    }
+
+    # 5. Cache de Otimização de Entrega
+    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+        try {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue | Out-Null
+            Write-Host 'Cache de Otimização de Entrega limpo.' -ForegroundColor DarkGreen
+        }
+        catch {}
+    }
+
+    # 6. Lixeira
     try {
         $shell = New-Object -ComObject Shell.Application
         $itemCount = $shell.Namespace(0xa).Items().Count
@@ -483,15 +772,16 @@ function Clear-TemporaryFiles {
     }
 
     Write-Host ''
-    Write-Host 'Limpeza concluída.' -ForegroundColor Cyan
+    Write-Host "Limpeza concluída! Espaço total liberado: $(Format-ByteSize $totalFreed)" -ForegroundColor Cyan
+    Write-Log "Limpeza segura concluída. Espaço liberado: $(Format-ByteSize $totalFreed)" 'INFO'
 }
 
 # =========================================================
-# OTIMIZAÇÃO SSD / HDD
+# OTIMIZAÇÃO SSD (TRIM) / HDD
 # =========================================================
 
 function Optimize-Drives {
-    Show-SectionTitle -Title 'OTIMIZAÇÃO DE UNIDADES'
+    Show-SectionTitle -Title 'OTIMIZAÇÃO INTELIGENTE DE UNIDADES'
 
     try {
         $trimStatus = fsutil behavior query DisableDeleteNotify
@@ -513,38 +803,73 @@ function Optimize-Drives {
         return
     }
 
+    # Pré-carregar discos físicos para consulta resiliente
+    $physDisks = @()
+    try {
+        $physDisks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue)
+    } catch {}
+
     foreach ($volume in $volumes) {
         Write-Host ''
         Write-Host "Unidade: $($volume.DriveLetter):" -ForegroundColor Green
 
         $mediaType = 'Desconhecido'
         $busType   = 'Desconhecido'
+        $isSsd     = $false
+        $diskNum   = $null
 
         try {
             $partition = Get-Partition -DriveLetter $volume.DriveLetter -ErrorAction Stop
-            $disk      = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
+            $diskNum   = $partition.DiskNumber
+            $disk      = Get-Disk -Number $diskNum -ErrorAction Stop
 
-            if ($disk.MediaType) { $mediaType = $disk.MediaType }
-            if ($disk.BusType)   { $busType   = $disk.BusType }
+            if ($disk.MediaType) { $mediaType = "$($disk.MediaType)" }
+            if ($disk.BusType)   { $busType   = "$($disk.BusType)" }
+
+            # Qualquer unidade com barramento NVMe é garantidamente SSD
+            if ($busType -eq 'NVMe' -or $mediaType -eq 'SSD') {
+                $isSsd = $true
+                if ($mediaType -eq 'Desconhecido' -or [string]::IsNullOrWhiteSpace($mediaType)) {
+                    $mediaType = if ($busType -eq 'NVMe') { 'SSD (NVMe)' } else { 'SSD' }
+                }
+            }
         }
         catch {
-            Write-Log "Aviso: Leitura física bloqueada pela controladora no disco $($volume.DriveLetter)." 'WARNING'
+            Write-Log "Aviso ao consultar partição/disco $($volume.DriveLetter): $_" 'WARNING' -Silent
+        }
+
+        # Fallback para Get-PhysicalDisk se ainda não confirmado
+        if (-not $isSsd -and $null -ne $diskNum) {
+            $phys = $physDisks | Where-Object { $_.DeviceId -eq $diskNum } | Select-Object -First 1
+            if ($phys) {
+                if ($phys.MediaType -eq 'SSD' -or $phys.BusType -eq 'NVMe') {
+                    $isSsd = $true
+                    $mediaType = if ($phys.BusType -eq 'NVMe') { 'SSD (NVMe)' } else { 'SSD' }
+                }
+                if ($busType -eq 'Desconhecido' -and $phys.BusType) {
+                    $busType = "$($phys.BusType)"
+                }
+            }
         }
 
         Write-Host "Mídia  : $mediaType"
         Write-Host "Bus    : $busType"
 
         try {
-            if ($mediaType -eq 'SSD') {
+            if ($isSsd) {
+                Write-Host 'Enviando comando TRIM (ReTrim)...' -ForegroundColor DarkGray
                 Optimize-Volume -DriveLetter $volume.DriveLetter -ReTrim -ErrorAction Stop | Out-Null
                 Write-Host 'TRIM executado com sucesso.' -ForegroundColor DarkGreen
+                Write-Log "TRIM executado com sucesso no disco $($volume.DriveLetter):" 'INFO'
             } else {
+                Write-Host 'Executando desfragmentação/otimização padrão...' -ForegroundColor DarkGray
                 Optimize-Volume -DriveLetter $volume.DriveLetter -ErrorAction Stop | Out-Null
                 Write-Host 'Otimização padrão executada com sucesso.' -ForegroundColor DarkGreen
+                Write-Log "Otimização padrão executada no disco $($volume.DriveLetter):" 'INFO'
             }
         }
         catch {
-            Write-Log "Falha ao otimizar $($volume.DriveLetter). (Pode estar em uso ou bloqueado)" 'ERROR'
+            Write-Log "Falha ao otimizar unidade $($volume.DriveLetter): $_" 'ERROR'
         }
     }
 }
@@ -559,16 +884,33 @@ function Show-StorageHealth {
     try {
         Write-Host 'Discos físicos:' -ForegroundColor Green
         Get-PhysicalDisk |
-        Select-Object FriendlyName, MediaType, HealthStatus,
+        Select-Object FriendlyName, MediaType, BusType, HealthStatus,
             @{Name='SizeGB';Expression={[math]::Round($_.Size / 1GB, 2)}} |
-        Format-Table -AutoSize
+        Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() }
 
         Write-Host ''
-        Write-Host 'Contadores de confiabilidade:' -ForegroundColor Green
-        Get-PhysicalDisk |
-        Get-StorageReliabilityCounter |
-        Select-Object Temperature, Wear, PowerOnHours, ReadErrorsTotal, WriteErrorsTotal |
-        Format-Table -AutoSize
+        Write-Host 'Contadores de confiabilidade (SMART):' -ForegroundColor Green
+        
+        $counters = Get-PhysicalDisk | ForEach-Object {
+            $disk = $_
+            $rc = $disk | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+            if ($rc) {
+                [PSCustomObject]@{
+                    Disco            = $disk.FriendlyName
+                    Temperatura_C    = if ($null -ne $rc.Temperature) { $rc.Temperature } else { 'N/A' }
+                    Desgaste_Wear    = if ($null -ne $rc.Wear) { "$($rc.Wear)%" } else { '0%' }
+                    Horas_Ligado     = if ($null -ne $rc.PowerOnHours) { $rc.PowerOnHours } else { 'N/A' }
+                    Erros_Leitura    = if ($null -ne $rc.ReadErrorsTotal) { $rc.ReadErrorsTotal } else { 0 }
+                    Erros_Gravacao   = if ($null -ne $rc.WriteErrorsTotal) { $rc.WriteErrorsTotal } else { 0 }
+                }
+            }
+        }
+
+        if ($counters) {
+            $counters | Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() }
+        } else {
+            Write-Host 'Métricas de confiabilidade SMART não fornecidas pela controladora.' -ForegroundColor DarkGray
+        }
     }
     catch {
         Write-Host 'SMART não disponível neste sistema.' -ForegroundColor Yellow
@@ -609,15 +951,42 @@ function Get-SystemSummary {
         $total = [math]::Round($_.Size / 1GB, 2)
         Write-Host "$($_.DriveLetter): $free GB livres de $total GB"
     }
+
+    if ($health.PendingReboot.IsPending) {
+        Write-Host ''
+        Write-Host 'ATENÇÃO:' -ForegroundColor Yellow
+        Write-Host "Reinicialização pendente: $($health.PendingReboot.Reasons -join '; ')" -ForegroundColor Yellow
+    }
 }
 
 # =========================================================
-# TEMPERATURA GPU NVIDIA
+# PLACAS DE VÍDEO (MULTI-GPU & TEMPERATURA)
 # =========================================================
 
-function Show-GpuTemperature {
-    Show-SectionTitle -Title 'TEMPERATURA GPU'
+function Show-GpuInformation {
+    Show-SectionTitle -Title 'PLACA DE VÍDEO (GPU)'
 
+    try {
+        $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+        if ($gpus) {
+            foreach ($gpu in $gpus) {
+                $ramGB = if ($gpu.AdapterRAM -and $gpu.AdapterRAM -gt 0) {
+                    "$([math]::Round($gpu.AdapterRAM / 1GB, 1)) GB"
+                } else { "Compartilhada / N/A" }
+
+                Write-Host "GPU     : $($gpu.Name)" -ForegroundColor Green
+                Write-Host "Driver  : $($gpu.DriverVersion)"
+                Write-Host "VRAM    : $ramGB"
+                Write-Host "Status  : $($gpu.Status)"
+                Write-Host ''
+            }
+        }
+    }
+    catch {
+        Write-Log 'Falha ao consultar adaptadores de vídeo.' 'WARNING' -Silent
+    }
+
+    # Sensor térmico NVIDIA (se existir)
     $nvidiaSmi = @(
         "$env:SystemRoot\System32\nvidia-smi.exe",
         'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe'
@@ -626,13 +995,13 @@ function Show-GpuTemperature {
     if ($nvidiaSmi) {
         try {
             $temp = & $nvidiaSmi --query-gpu=temperature.gpu --format=csv,noheader
-            Write-Host "GPU NVIDIA: $($temp.Trim()) °C" -ForegroundColor Green
+            if ($temp) {
+                Write-Host "Temperatura NVIDIA : $($temp.Trim()) °C" -ForegroundColor DarkGreen
+            }
         }
         catch {
-            Write-Log 'Falha ao consultar GPU NVIDIA.' 'WARNING'
+            Write-Log 'Falha ao consultar GPU NVIDIA.' 'WARNING' -Silent
         }
-    } else {
-        Write-Host 'nvidia-smi não encontrado.' -ForegroundColor Yellow
     }
 }
 
@@ -641,13 +1010,13 @@ function Show-GpuTemperature {
 # =========================================================
 
 function Show-HeavyProcesses {
-    Show-SectionTitle -Title 'PROCESSOS MAIS PESADOS'
+    Show-SectionTitle -Title 'PROCESSOS MAIS PESADOS (TOP 10)'
 
     Get-Process |
     Sort-Object WorkingSet64 -Descending |
     Select-Object -First 10 -Property Name, Id, CPU,
         @{Name='RAM_MB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}} |
-    Format-Table -AutoSize
+    Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() }
 }
 
 # =========================================================
@@ -655,12 +1024,21 @@ function Show-HeavyProcesses {
 # =========================================================
 
 function Show-StartupAnalysis {
-    Show-SectionTitle -Title 'ANÁLISE DE STARTUP'
+    Show-SectionTitle -Title 'APLICATIVOS DE INICIALIZAÇÃO'
 
     try {
-        Get-CimInstance Win32_StartupCommand |
-        Select-Object Name, User, Location |
-        Format-Table -AutoSize
+        $startups = Get-CimInstance Win32_StartupCommand -ErrorAction Stop
+        if ($startups) {
+            $startups |
+            Select-Object @{Name='Nome';Expression={$_.Name}},
+                          @{Name='Usuario';Expression={$_.User}},
+                          @{Name='Local';Expression={
+                              if ($_.Location.Length -gt 45) { $_.Location.Substring(0, 42) + '...' } else { $_.Location }
+                          }} |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() }
+        } else {
+            Write-Host 'Nenhum aplicativo de inicialização registrado.' -ForegroundColor DarkGreen
+        }
     }
     catch {
         Write-Log 'Falha ao listar startup apps.' 'WARNING'
@@ -668,37 +1046,42 @@ function Show-StartupAnalysis {
 }
 
 # =========================================================
-# EVENTOS CRÍTICOS
+# EVENTOS CRÍTICOS (FILTRADOS)
 # =========================================================
 
 function Show-CriticalEvents {
-    Show-SectionTitle -Title 'EVENTOS CRÍTICOS RECENTES'
+    Show-SectionTitle -Title 'EVENTOS CRÍTICOS RECENTES (ÚLTIMAS 72H)'
 
     try {
-        Get-WinEvent -FilterHashtable @{
-            LogName = 'System'
-            Level   = 1,2
-        } -MaxEvents 15 |
-        Select-Object TimeCreated, Id, ProviderName, LevelDisplayName |
-        Format-Table -AutoSize
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'System'
+            Level     = 1,2
+            StartTime = (Get-Date).AddHours(-72)
+        } -MaxEvents 60 -ErrorAction Stop |
+        Where-Object { $_.Id -notin $script:CosmeticEventIds } |
+        Select-Object -First 15
+
+        if ($events -and @($events).Count -gt 0) {
+            $events |
+            Select-Object TimeCreated, Id, ProviderName, LevelDisplayName |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_.TrimEnd() }
+        } else {
+            Write-Host 'Nenhum evento crítico relevante encontrado nas últimas 72 horas.' -ForegroundColor DarkGreen
+        }
     }
     catch {
-        Write-Log 'Falha ao consultar eventos críticos.' 'WARNING'
+        Write-Host 'Nenhum evento crítico recente encontrado nas últimas 72 horas.' -ForegroundColor DarkGreen
     }
 }
 
 # =========================================================
-# REPARO PROFUNDO
+# REPARO PROFUNDO & COMPONENT STORE
 # =========================================================
 
 function Repair-WindowsImage {
-    Show-SectionTitle -Title 'REPARO PROFUNDO WINDOWS' -Color Magenta
+    Show-SectionTitle -Title 'REPARO PROFUNDO WINDOWS (DISM + SFC)' -Color Magenta
 
-    Write-Host 'Executando DISM (pode demorar)...' -ForegroundColor Green
-
-    # Invoke-ConsoleCommand é usado aqui porque DISM e SFC escrevem
-    # diretamente no buffer do console em UTF-16, o que impede o
-    # operador & de capturar o output corretamente.
+    Write-Host '1/2 Executando DISM /RestoreHealth (pode demorar)...' -ForegroundColor Green
     $dismExit = Invoke-ConsoleCommand `
         -FilePath 'DISM.exe' `
         -Arguments @('/Online','/Cleanup-Image','/RestoreHealth')
@@ -707,8 +1090,7 @@ function Repair-WindowsImage {
     Write-Host "DISM ExitCode: $dismExit"
 
     Write-Host ''
-    Write-Host 'Executando SFC (pode demorar)...' -ForegroundColor Green
-
+    Write-Host '2/2 Executando SFC /scannow (pode demorar)...' -ForegroundColor Green
     $sfcExit = Invoke-ConsoleCommand `
         -FilePath 'sfc.exe' `
         -Arguments @('/scannow')
@@ -720,20 +1102,141 @@ function Repair-WindowsImage {
     Write-Host 'Reparo concluído.' -ForegroundColor Cyan
 }
 
+function Cleanup-ComponentStore {
+    Show-SectionTitle -Title 'LIMPEZA DO ARMAZENAMENTO DE COMPONENTES (WINSXS)' -Color Magenta
+
+    Write-Host 'Executando DISM /StartComponentCleanup...' -ForegroundColor Green
+    Write-Host 'Isso remove com segurança arquivos substituídos de atualizações antigas.' -ForegroundColor DarkGray
+
+    $exitCode = Invoke-ConsoleCommand `
+        -FilePath 'DISM.exe' `
+        -Arguments @('/Online','/Cleanup-Image','/StartComponentCleanup')
+
+    Write-Host ''
+    Write-Host "DISM Cleanup ExitCode: $exitCode"
+    Write-Host 'Limpeza da pasta WinSxS concluída.' -ForegroundColor Cyan
+}
+
 # =========================================================
-# EXPORTAÇÃO RELATÓRIO
+# PONTO DE RESTAURAÇÃO & REDE
+# =========================================================
+
+function New-MaintenanceRestorePoint {
+    Show-SectionTitle -Title 'CRIAR PONTO DE RESTAURAÇÃO'
+
+    try {
+        Write-Host 'Criando ponto de restauração do sistema...' -ForegroundColor Green
+        Checkpoint-Computer -Description "Windows Maintenance Suite Pro Backup" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+        Write-Host 'Ponto de restauração criado com sucesso.' -ForegroundColor DarkGreen
+        Write-Log 'Ponto de restauração criado com sucesso.' 'INFO'
+    }
+    catch {
+        Write-Host "Aviso: Não foi possível criar ponto de restauração ($($_))." -ForegroundColor Yellow
+        Write-Host 'Verifique se a Proteção do Sistema está ativada na unidade C:.' -ForegroundColor DarkGray
+        Write-Log "Aviso ao criar ponto de restauração: $_" 'WARNING'
+    }
+}
+
+function Clear-NetworkCache {
+    Show-SectionTitle -Title 'LIMPEZA DE CACHE DNS E REDE'
+
+    try {
+        Clear-DnsClientCache -ErrorAction Stop
+        Write-Host 'Cache de resolução DNS limpo com sucesso.' -ForegroundColor DarkGreen
+        Write-Log 'Cache DNS limpo com sucesso.' 'INFO'
+    }
+    catch {
+        Write-Log "Falha ao limpar cache DNS: $_" 'WARNING'
+    }
+}
+
+# =========================================================
+# GERENCIAMENTO DE TAREFAS AGENDADAS
+# =========================================================
+
+function Install-MaintenanceTask {
+    Show-SectionTitle -Title 'CONFIGURAR AGENDAMENTO AUTOMÁTICO'
+
+    $taskName = 'WindowsMaintenanceSuite'
+    $scriptFile = $MyInvocation.MyCommand.Definition
+    if (-not $scriptFile) { $scriptFile = $PSCommandPath }
+    if (-not $scriptFile) { $scriptFile = Join-Path $PSScriptRoot 'Manutencao.ps1' }
+
+    try {
+        $action = New-ScheduledTaskAction `
+            -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptFile`" -Auto -ExportReport -HtmlReport"
+
+        # Execução semanal aos Domingos às 03:00 da manhã
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId $env:USERNAME `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries:$false `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -WakeToRun:$false
+
+        Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Description 'Rotina semanal automática do Windows Maintenance Suite Pro.' `
+            -Force | Out-Null
+
+        Write-Host "Tarefa '$taskName' agendada com sucesso!" -ForegroundColor DarkGreen
+        Write-Host 'Frequência: Semanalmente aos Domingos às 03:00 (execução invisível).' -ForegroundColor White
+        Write-Log "Tarefa agendada '$taskName' registrada com sucesso." 'INFO'
+    }
+    catch {
+        Write-Host "Falha ao agendar tarefa: $_" -ForegroundColor Red
+        Write-Log "Falha ao registrar tarefa agendada: $_" 'ERROR'
+    }
+}
+
+function Uninstall-MaintenanceTask {
+    Show-SectionTitle -Title 'REMOVER TAREFA AGENDADA'
+
+    $taskName = 'WindowsMaintenanceSuite'
+    try {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null
+            Write-Host "Tarefa '$taskName' desinstalada com sucesso." -ForegroundColor DarkGreen
+            Write-Log "Tarefa agendada '$taskName' desinstalada." 'INFO'
+        } else {
+            Write-Host "A tarefa '$taskName' não está registrada no sistema." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "Falha ao remover tarefa agendada: $_" -ForegroundColor Red
+        Write-Log "Falha ao desinstalar tarefa agendada: $_" 'ERROR'
+    }
+}
+
+# =========================================================
+# EXPORTAÇÃO DE RELATÓRIOS (TXT & HTML MODERNO)
 # =========================================================
 
 function Export-SystemReport {
     try {
         $health = Get-SystemHealth
         $os = Get-CimInstance Win32_OperatingSystem
+        $bat = Get-BatteryHealth
+        $dateStr = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
+        # ---------------- TXT REPORT ----------------
         $content = @()
         $content += '================================================='
         $content += 'WINDOWS MAINTENANCE SUITE PRO'
         $content += "Versão        : $($script:Version)"
-        $content += "Gerado em     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $content += "Gerado em     : $dateStr"
         $content += "Classificação : $($health.Status)"
         $content += "Pontuação     : $($health.Score)/100"
         $content += '================================================='
@@ -744,6 +1247,7 @@ function Export-SystemReport {
             "Windows    : $($os.Caption)"
             "Build      : $($os.BuildNumber)"
             "Uptime     : $($health.UptimeDays) dias, $($health.UptimeHours) horas"
+            $(if ($health.PendingReboot.IsPending) { "Reboot Pendente: SIM ($($health.PendingReboot.Reasons -join '; '))" } else { "Reboot Pendente: Não" })
         )
 
         $content += Format-Section -Title 'SAÚDE DO SISTEMA' -Content @(
@@ -760,6 +1264,17 @@ function Export-SystemReport {
             })
         )
 
+        if ($bat) {
+            $content += Format-Section -Title 'SAÚDE DA BATERIA' -Content @(
+                "Química da Bateria     : $($bat.Chemistry)"
+                "Carga Atual            : $($bat.EstimatedChargePercent)%"
+                "Capacidade de Projeto  : $($bat.DesignCapacityMWh) mWh"
+                "Capacidade Carga Máx.  : $($bat.FullChargeCapacityMWh) mWh"
+                "Ciclos de Carga        : $($bat.CycleCount)"
+                "Desgaste (Wear Level)  : $($bat.WearPercent)%"
+            )
+        }
+
         $diskContent = Get-Volume |
             Where-Object DriveLetter |
             ForEach-Object {
@@ -769,49 +1284,54 @@ function Export-SystemReport {
             }
         $content += Format-Section -Title 'DISCOS' -Content $diskContent
 
+        $physicalDisks = @()
         try {
-            $physicalDisks = Get-PhysicalDisk |
-                Select-Object FriendlyName, MediaType, HealthStatus,
-                    @{Name='SizeGB';Expression={[math]::Round($_.Size / 1GB, 2)}}
+            $physicalDisks = @(Get-PhysicalDisk |
+                Select-Object FriendlyName, MediaType, BusType, HealthStatus,
+                    @{Name='SizeGB';Expression={[math]::Round($_.Size / 1GB, 2)}})
             $content += Format-Section -Title 'DISCOS FÍSICOS' -Content $physicalDisks
         }
         catch {
             $content += Format-Section -Title 'DISCOS FÍSICOS' -Content 'Informações físicas não disponíveis.'
         }
 
+        $counters = @()
         try {
-            $smart = Get-PhysicalDisk |
-                Get-StorageReliabilityCounter |
-                Select-Object Temperature, Wear, PowerOnHours, ReadErrorsTotal, WriteErrorsTotal
-            $content += Format-Section -Title 'SMART / STORAGE HEALTH' -Content $smart
+            $counters = @(Get-PhysicalDisk | ForEach-Object {
+                $d = $_
+                $rc = $d | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue
+                if ($rc) {
+                    [PSCustomObject]@{
+                        Disco       = $d.FriendlyName
+                        Temp_C      = if ($null -ne $rc.Temperature) { $rc.Temperature } else { 'N/A' }
+                        Desgaste    = if ($null -ne $rc.Wear) { "$($rc.Wear)%" } else { '0%' }
+                        Erros_Total = ($rc.ReadErrorsTotal + $rc.WriteErrorsTotal)
+                    }
+                }
+            })
+            $content += Format-Section -Title 'SMART / STORAGE HEALTH' -Content $counters
         }
         catch {
             $content += Format-Section -Title 'SMART / STORAGE HEALTH' -Content 'SMART não disponível.'
         }
 
-        $gpuInfo   = 'nvidia-smi não encontrado.'
-        $nvidiaSmi = @(
-            "$env:SystemRoot\System32\nvidia-smi.exe",
-            'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe'
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-        if ($nvidiaSmi) {
-            try {
-                $temp    = & $nvidiaSmi --query-gpu=temperature.gpu --format=csv,noheader
-                $gpuInfo = "GPU NVIDIA: $($temp.Trim()) °C"
-            }
-            catch {
-                $gpuInfo = 'Falha ao consultar GPU.'
-            }
+        $gpus = @()
+        try {
+            $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+                    Select-Object Name, DriverVersion, Status)
+            $content += Format-Section -Title 'ADAPTADORES DE VÍDEO (GPU)' -Content $gpus
         }
+        catch {}
 
-        $content += Format-Section -Title 'TEMPERATURA GPU' -Content $gpuInfo
-
-        $heavyProcesses = Get-Process |
-            Sort-Object WorkingSet64 -Descending |
-            Select-Object -First 10 -Property Name, Id, CPU,
-                @{Name='RAM_MB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}}
-        $content += Format-Section -Title 'PROCESSOS MAIS PESADOS' -Content $heavyProcesses
+        $heavyProcesses = @()
+        try {
+            $heavyProcesses = @(Get-Process |
+                Sort-Object WorkingSet64 -Descending |
+                Select-Object -First 10 -Property Name, Id, CPU,
+                    @{Name='RAM_MB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}})
+            $content += Format-Section -Title 'PROCESSOS MAIS PESADOS' -Content $heavyProcesses
+        }
+        catch {}
 
         try {
             $startup = Get-CimInstance Win32_StartupCommand |
@@ -822,20 +1342,233 @@ function Export-SystemReport {
             $content += Format-Section -Title 'STARTUP APPS' -Content 'Falha ao listar startup apps.'
         }
 
+        $criticalEvents = @()
         try {
-            $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1,2 } -MaxEvents 15 |
-                Select-Object TimeCreated, Id, ProviderName, LevelDisplayName
-            $content += Format-Section -Title 'EVENTOS CRÍTICOS RECENTES' -Content $events
+            $criticalEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1,2; StartTime = (Get-Date).AddHours(-72) } -MaxEvents 60 |
+                Where-Object { $_.Id -notin $script:CosmeticEventIds } |
+                Select-Object -First 15 |
+                Select-Object TimeCreated, Id, ProviderName, LevelDisplayName)
+            $content += Format-Section -Title 'EVENTOS CRÍTICOS RECENTES' -Content $criticalEvents
         }
         catch {
-            $content += Format-Section -Title 'EVENTOS CRÍTICOS RECENTES' -Content 'Falha ao consultar eventos.'
+            $content += Format-Section -Title 'EVENTOS CRÍTICOS RECENTES' -Content 'Nenhum evento relevante recente.'
         }
 
         $content -join "`r`n" | Out-File $script:ReportPath -Encoding UTF8
 
+        # ---------------- HTML REPORT ----------------
+        $badgeClass = switch ($health.Status) {
+            'BOM'     { 'status-good' }
+            'ATENÇÃO' { 'status-warning' }
+            default   { 'status-critical' }
+        }
+
+        $notesHtml = ''
+        if ($health.Notes.Count -gt 0) {
+            $notesHtml = "<ul>" + (($health.Notes | ForEach-Object { "<li>$_</li>" }) -join '') + "</ul>"
+        } else {
+            $notesHtml = "<p style='color: var(--text-muted);'>Nenhuma anomalia crítica observada no sistema.</p>"
+        }
+
+        $batteryCard = ''
+        if ($bat) {
+            $batteryCard = @"
+            <div class="card">
+                <div class="card-title">BATERIA (NOTEBOOK)</div>
+                <div class="stat-row"><span>Carga Atual:</span><strong>$($bat.EstimatedChargePercent)%</strong></div>
+                <div class="stat-row"><span>Capacidade Carga:</span><strong>$($bat.FullChargeCapacityMWh) / $($bat.DesignCapacityMWh) mWh</strong></div>
+                <div class="stat-row"><span>Ciclos de Carga:</span><strong>$($bat.CycleCount)</strong></div>
+                <div class="stat-row"><span>Desgaste (Wear):</span><strong style="color: $(if($bat.WearPercent -ge 20){'#ef4444'}else{'#10b981'});">$($bat.WearPercent)%</strong></div>
+            </div>
+"@
+        }
+
+        $rebootAlert = ''
+        if ($health.PendingReboot.IsPending) {
+            $rebootAlert = "<div class='alert-banner'>⚠️ Reinicialização Pendente: $($health.PendingReboot.Reasons -join '; ')</div>"
+        }
+
+        # HTML Tabelas
+        $gpuRows = ($gpus | ForEach-Object { "<tr><td><strong>$($_.Name)</strong></td><td>$($_.DriverVersion)</td><td>$($_.Status)</td></tr>" }) -join ''
+        $diskRows = ($physicalDisks | ForEach-Object { "<tr><td><strong>$($_.FriendlyName)</strong></td><td>$($_.MediaType)</td><td>$($_.BusType)</td><td>$($_.SizeGB) GB</td><td>$($_.HealthStatus)</td></tr>" }) -join ''
+        $processRows = ($heavyProcesses | ForEach-Object { "<tr><td>$($_.Name)</td><td>$($_.Id)</td><td><strong>$($_.RAM_MB) MB</strong></td><td>$($_.CPU)</td></tr>" }) -join ''
+        
+        $eventRows = ''
+        if ($criticalEvents -and $criticalEvents.Count -gt 0) {
+            $eventRows = ($criticalEvents | ForEach-Object {
+                $levelClass = if ($_.LevelDisplayName -eq 'Crítico' -or $_.Id -eq 41) { 'style="color: var(--red); font-weight: bold;"' } else { 'style="color: var(--yellow);"' }
+                "<tr><td>$($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))</td><td>$($_.Id)</td><td>$($_.ProviderName)</td><td $levelClass>$($_.LevelDisplayName)</td></tr>"
+            }) -join ''
+        } else {
+            $eventRows = "<tr><td colspan='4' style='text-align:center; color: var(--green);'>Nenhum evento de erro relevante nas últimas 72 horas.</td></tr>"
+        }
+
+        $html = @"
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Windows Maintenance Suite Pro - Relatório</title>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card-bg: #111827;
+            --border: #1f2937;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --accent-cyan: #06b6d4;
+            --green: #10b981;
+            --yellow: #f59e0b;
+            --red: #ef4444;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+        body { background: var(--bg); color: var(--text-main); padding: 32px 16px; display: flex; justify-content: center; }
+        .container { max-width: 1050px; width: 100%; }
+        header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 28px; display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 16px; }
+        h1 { font-size: 24px; color: #fff; font-weight: 700; letter-spacing: -0.5px; }
+        .meta { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+        .alert-banner { background: rgba(245, 158, 11, 0.15); border: 1px solid var(--yellow); color: var(--yellow); padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; font-weight: 500; font-size: 14px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 28px; }
+        .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+        .card-title { font-size: 12px; font-weight: 600; color: var(--text-muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 12px; }
+        .score-box { display: flex; align-items: center; justify-content: space-between; }
+        .score-val { font-size: 38px; font-weight: 800; color: #fff; }
+        .status-badge { padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+        .status-good { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid var(--green); }
+        .status-warning { background: rgba(245, 158, 11, 0.2); color: var(--yellow); border: 1px solid var(--yellow); }
+        .status-critical { background: rgba(239, 68, 68, 0.2); color: var(--red); border: 1px solid var(--red); }
+        .stat-row { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 8px; }
+        .stat-row span { color: var(--text-muted); }
+        .progress-bar { width: 100%; height: 8px; background: #1f2937; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+        .progress-fill { height: 100%; background: var(--accent-cyan); border-radius: 4px; }
+        .section-box { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+        .section-box h2 { font-size: 16px; margin-bottom: 16px; color: var(--accent-cyan); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+        ul { padding-left: 20px; font-size: 14px; line-height: 1.6; color: #e5e7eb; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+        th { background: #1f2937; color: var(--text-muted); padding: 10px 12px; font-weight: 600; border-bottom: 1px solid var(--border); }
+        td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.05); color: #d1d5db; }
+        tr:last-child td { border-bottom: none; }
+        footer { text-align: center; font-size: 12px; color: var(--text-muted); margin-top: 36px; border-top: 1px solid var(--border); padding-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>🛠️ Windows Maintenance Suite Pro</h1>
+                <div class="meta">Relatório de Diagnóstico e Saúde do Sistema | Versão $($script:Version)</div>
+            </div>
+            <div class="meta" style="text-align: right;">
+                Computador: <strong>$env:COMPUTERNAME</strong><br>
+                Gerado em: $dateStr
+            </div>
+        </header>
+
+        $rebootAlert
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">PONTUAÇÃO DE SAÚDE</div>
+                <div class="score-box">
+                    <div class="score-val">$($health.Score)<span style="font-size: 18px; color: var(--text-muted);">/100</span></div>
+                    <div class="status-badge $badgeClass">$($health.Status)</div>
+                </div>
+                <div class="progress-bar" style="margin-top: 14px;">
+                    <div class="progress-fill" style="width: $($health.Score)%; background: $(if($health.Score -ge 85){'#10b981'}elseif($health.Score -ge 65){'#f59e0b'}else{'#ef4444'});"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">MEMÓRIA RAM</div>
+                <div class="stat-row"><span>Uso Total:</span><strong>$($health.RamUsedPercent)%</strong></div>
+                <div class="stat-row"><span>Em Uso:</span><strong>$($health.RamUsedGB) GB</strong></div>
+                <div class="stat-row"><span>Livre:</span><strong>$($health.RamFreeGB) GB de $($health.RamTotalGB) GB</strong></div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: $($health.RamUsedPercent)%;"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">DISCO DO SISTEMA (C:)</div>
+                <div class="stat-row"><span>Espaço Livre:</span><strong>$($health.FreeSystemDrivePercent)%</strong></div>
+                <div class="stat-row"><span>Uptime:</span><strong>$($health.UptimeDays)d $($health.UptimeHours)h</strong></div>
+                <div class="stat-row"><span>Erros Críticos (72h):</span><strong>$($health.CriticalEvents72h)</strong></div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: $(100 - $health.FreeSystemDrivePercent)%; background: #06b6d4;"></div>
+                </div>
+            </div>
+
+            $batteryCard
+        </div>
+
+        <div class="section-box">
+            <h2>OBSERVAÇÕES E ALERTAS TÉCNICOS</h2>
+            $notesHtml
+        </div>
+
+        <div class="section-box">
+            <h2>ADAPTADORES DE VÍDEO (GPU)</h2>
+            <table>
+                <thead>
+                    <tr><th>Placa de Vídeo</th><th>Versão do Driver</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                    $gpuRows
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-box">
+            <h2>DISCOS FÍSICOS & ARMAZENAMENTO</h2>
+            <table>
+                <thead>
+                    <tr><th>Dispositivo</th><th>Tipo de Mídia</th><th>Barramento</th><th>Capacidade</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                    $diskRows
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-box">
+            <h2>PROCESSOS MAIS PESADOS (TOP 10)</h2>
+            <table>
+                <thead>
+                    <tr><th>Nome</th><th>PID</th><th>Memória RAM</th><th>Tempo CPU</th></tr>
+                </thead>
+                <tbody>
+                    $processRows
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-box">
+            <h2>EVENTOS CRÍTICOS & ERROS RECENTES (ÚLTIMAS 72H)</h2>
+            <table>
+                <thead>
+                    <tr><th>Data / Hora</th><th>Event ID</th><th>Origem / Provedor</th><th>Nível</th></tr>
+                </thead>
+                <tbody>
+                    $eventRows
+                </tbody>
+            </table>
+        </div>
+
+        <footer>
+            Windows Maintenance Suite Pro v$($script:Version) • Relatório gerado automaticamente em $dateStr
+        </footer>
+    </div>
+</body>
+</html>
+"@
+
+        $html | Out-File $script:HtmlReportPath -Encoding UTF8
+
         Write-Host ''
-        Write-Host 'Relatório exportado:' -ForegroundColor Green
-        Write-Host $script:ReportPath -ForegroundColor Cyan
+        Write-Host 'Relatórios exportados com sucesso:' -ForegroundColor Green
+        Write-Host "Texto : $script:ReportPath" -ForegroundColor Cyan
+        Write-Host "HTML  : $script:HtmlReportPath" -ForegroundColor Cyan
     }
     catch {
         Write-Log "Falha ao exportar relatório: $_" 'ERROR'
@@ -868,7 +1601,7 @@ function Open-WindowsTools {
 }
 
 # =========================================================
-# ROTINA LEVE
+# ROTINAS DE AUTOMAÇÃO
 # =========================================================
 
 function Invoke-LightMaintenance {
@@ -888,18 +1621,15 @@ function Invoke-LightMaintenance {
     Write-Host 'Rotina concluída.' -ForegroundColor Cyan
 }
 
-# =========================================================
-# DIAGNÓSTICO AVANÇADO
-# =========================================================
-
 function Invoke-AdvancedDiagnostics {
     Show-Header
 
-    Write-Host 'DIAGNÓSTICO AVANÇADO' -ForegroundColor Magenta
+    Write-Host 'DIAGNÓSTICO AVANÇADO COMPLETO' -ForegroundColor Magenta
 
     Get-SystemSummary
     Show-StorageHealth
-    Show-GpuTemperature
+    Show-GpuInformation
+    Show-BatteryStatus
     Show-HeavyProcesses
     Show-StartupAnalysis
     Show-CriticalEvents
@@ -908,7 +1638,7 @@ function Invoke-AdvancedDiagnostics {
         Show-HealthSummary -Health $script:LastHealthSummary
     }
 
-    if ($ExportReport) {
+    if ($ExportReport -or $HtmlReport) {
         Export-SystemReport
     }
 
@@ -917,14 +1647,28 @@ function Invoke-AdvancedDiagnostics {
 }
 
 # =========================================================
-# EXECUÇÃO AUTOMÁTICA
+# EXECUÇÃO AUTOMÁTICA & CLI
 # =========================================================
+
+if ($InstallTask) {
+    Install-MaintenanceTask
+    exit 0
+}
+
+if ($RemoveTask) {
+    Uninstall-MaintenanceTask
+    exit 0
+}
 
 if ($Auto) {
     Invoke-LightMaintenance
 
     if ($Advanced) {
         Invoke-AdvancedDiagnostics
+    }
+
+    if ($ExportReport -or $HtmlReport) {
+        Export-SystemReport
     }
 
     exit 0
@@ -937,49 +1681,66 @@ if ($Auto) {
 Do {
     Show-Header
 
-    Write-Host '1  Limpeza segura de temporários'
-    Write-Host '2  Otimização SSD / HDD'
-    Write-Host '3  Relatório do sistema'
-    Write-Host '4  SMART / SSD Health'
-    Write-Host '5  Temperatura GPU'
-    Write-Host '6  Processos pesados'
-    Write-Host '7  Startup apps'
-    Write-Host '8  Eventos críticos Windows'
-    Write-Host '9  Abrir ferramentas Windows'
-    Write-Host '10 Exportar relatório técnico'
+    Write-Host '--- MANUTENÇÃO & OTIMIZAÇÃO ---' -ForegroundColor Cyan
+    Write-Host '1   Limpeza segura de temporários e cache'
+    Write-Host '2   Otimização inteligente SSD (TRIM) / HDD'
+    Write-Host '3   Limpeza de cache DNS e Rede'
     Write-Host ''
-    Write-Host '--- AUTOMAÇÃO ---' -ForegroundColor Yellow
-    Write-Host '11 Executar rotina leve'
-    Write-Host '12 Executar diagnóstico avançado'
+    Write-Host '--- DIAGNÓSTICO & HARDWARE ---' -ForegroundColor Green
+    Write-Host '4   Relatório geral de saúde do sistema'
+    Write-Host '5   Saúde de armazenamento (SMART / SSD)'
+    Write-Host '6   Placas de vídeo (Multi-GPU & Temperatura)'
+    Write-Host '7   Saúde da bateria (Notebook)'
+    Write-Host '8   Processos mais pesados (RAM / CPU)'
+    Write-Host '9   Aplicativos de inicialização (Startup)'
+    Write-Host '10  Eventos críticos e desligamentos anormais'
     Write-Host ''
-    Write-Host '--- REPARO PROFUNDO ---' -ForegroundColor Magenta
-    Write-Host '13 DISM + SFC'
+    Write-Host '--- RELATÓRIOS & FERRAMENTAS ---' -ForegroundColor White
+    Write-Host '11  Exportar relatório técnico (TXT + HTML)'
+    Write-Host '12  Abrir ferramentas nativas do Windows'
+    Write-Host '13  Criar ponto de restauração do sistema'
     Write-Host ''
-    Write-Host '0  Sair'
+    Write-Host '--- AUTOMAÇÃO & AGENDAMENTO ---' -ForegroundColor Yellow
+    Write-Host '14  Executar rotina leve de manutenção'
+    Write-Host '15  Executar diagnóstico avançado completo'
+    Write-Host '16  Instalar tarefa semanal no Agendador do Windows'
+    Write-Host '17  Remover tarefa do Agendador do Windows'
+    Write-Host ''
+    Write-Host '--- REPARO PROFUNDO & SISTEMA ---' -ForegroundColor Magenta
+    Write-Host '18  Reparo de imagem e integridade (DISM + SFC)'
+    Write-Host '19  Limpeza do armazenamento de componentes (WinSxS)'
+    Write-Host ''
+    Write-Host '0   Sair'
     Write-Host ''
 
-    $option = Read-Host 'Escolha'
+    $option = Read-Host 'Escolha uma opção'
 
     switch ($option) {
-        '1'  { Clear-TemporaryFiles;  Pause-Console }
-        '2'  { Optimize-Drives;       Pause-Console }
-        '3'  {
+        '1'  { Clear-TemporaryFiles;       Pause-Console }
+        '2'  { Optimize-Drives;            Pause-Console }
+        '3'  { Clear-NetworkCache;         Pause-Console }
+        '4'  {
             Get-SystemSummary
             if ($script:LastHealthSummary) {
                 Show-HealthSummary -Health $script:LastHealthSummary
             }
             Pause-Console
         }
-        '4'  { Show-StorageHealth;    Pause-Console }
-        '5'  { Show-GpuTemperature;   Pause-Console }
-        '6'  { Show-HeavyProcesses;   Pause-Console }
-        '7'  { Show-StartupAnalysis;  Pause-Console }
-        '8'  { Show-CriticalEvents;   Pause-Console }
-        '9'  { Open-WindowsTools;     Pause-Console }
-        '10' { Export-SystemReport;   Pause-Console }
-        '11' { Invoke-LightMaintenance;    Pause-Console }
-        '12' { Invoke-AdvancedDiagnostics; Pause-Console }
-        '13' { Repair-WindowsImage;        Pause-Console }
+        '5'  { Show-StorageHealth;         Pause-Console }
+        '6'  { Show-GpuInformation;        Pause-Console }
+        '7'  { Show-BatteryStatus;         Pause-Console }
+        '8'  { Show-HeavyProcesses;        Pause-Console }
+        '9'  { Show-StartupAnalysis;       Pause-Console }
+        '10' { Show-CriticalEvents;        Pause-Console }
+        '11' { Export-SystemReport;        Pause-Console }
+        '12' { Open-WindowsTools;          Pause-Console }
+        '13' { New-MaintenanceRestorePoint;Pause-Console }
+        '14' { Invoke-LightMaintenance;    Pause-Console }
+        '15' { Invoke-AdvancedDiagnostics; Pause-Console }
+        '16' { Install-MaintenanceTask;    Pause-Console }
+        '17' { Uninstall-MaintenanceTask;  Pause-Console }
+        '18' { Repair-WindowsImage;        Pause-Console }
+        '19' { Cleanup-ComponentStore;     Pause-Console }
         '0'  { exit 0 }
         default {
             Write-Host 'Opção inválida.' -ForegroundColor Red
