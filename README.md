@@ -1,4 +1,4 @@
-﻿# 🛠️ Windows Maintenance Suite Pro v3.0
+# 🛠️ Windows Maintenance Suite Pro v3.1
 
 Um script de nível Enterprise (SysAdmin) escrito em PowerShell para manutenção, otimização e diagnóstico avançado do Windows 10 e 11.
 
@@ -23,13 +23,14 @@ Diferente da maioria dos "otimizadores" duvidosos da internet, este script possu
 - **Saúde da Bateria:** Identifica notebooks e calcula capacidade original de projeto, carga máxima atual, número de ciclos e nível de desgaste (*Wear Level*).
 - **Suporte Multi-GPU:** Detecta placas dedicadas (ex: NVIDIA RTX) e gráficos integrados (AMD Radeon / Intel), exibindo versões de driver, memória VRAM e temperatura da GPU via `nvidia-smi`.
 - **SMART & SSD Health:** Monitora desgaste do SSD e erros de leitura/gravação.
-- **Detecção de Reboot Pendente:** Alerta se há atualizações do Windows ou arquivos aguardando reinicialização.
+- **Detecção Inteligente de Reboot Pendente:** Distingue reinicializações reais do sistema operacional (Windows Update / CBS) de filas temporárias de renomeação de aplicativos (OneDrive/Edge), prevenindo falsos descontos na pontuação de saúde.
 
 ### 🛡️ Estabilidade, Eventos & Reparo
 - **Filtro Unificado de Eventos:** Exclui ruídos cosméticos de DCOM (10005, 10010) e destaca quedas de energia anormais (`Kernel-Power 41`) e telas azuis (`BugCheck 1001`).
 - **Reparo Profundo NATIVO:** Orquestra `DISM /RestoreHealth` e `SFC /scannow` com captura de codificação UTF-16LE corrigida (sem caracteres corrompidos no log).
-- **Limpeza do Armazenamento de Componentes (WinSxS):** Executa `DISM /StartComponentCleanup` para recuperar espaço de atualizações substituídas.
+- **Limpeza do Armazenamento de Componentes (WinSxS):** Executa `DISM /StartComponentCleanup` para recuperar espaço de atualizações substituídas, com tratamento resiliente para inconsistências de pacotes legados (código 1726/RPC).
 - **Ponto de Restauração:** Criação de pontos de proteção do sistema diretamente pelo menu.
+- **Codificação UTF-8 com BOM:** Suporte nativo e à prova de falhas a caracteres em Português (PT-BR) no Windows PowerShell 5.1 e superiores.
 
 ### 📊 Relatório Visual em HTML
 - Exporta tanto o tradicional `SystemReport.txt` quanto um moderno dashboard `SystemReport.html` em modo escuro, com barras de progresso, cartões de métricas e tabela de eventos críticos.
@@ -51,10 +52,12 @@ Você pode automatizar a manutenção semanal de duas formas simples:
    powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Caminho\Manutencao.ps1" -Auto -ExportReport -HtmlReport
    ```
 
-### Parâmetros Suportados:
-- `-Auto`: Executa a rotina leve sem intervenção interativa.
-- `-Advanced`: Executa o diagnóstico completo.
-- `-ExportReport`: Gera o relatório em texto (`SystemReport.txt`).
+### ⌨️ Parâmetros de Linha de Comando Suportados:
+- `-Routine <1-19>`: Executa diretamente qualquer rotina do menu (ex: `-Routine 14` para manutenção leve ou `-Routine 15` para diagnóstico avançado).
+- `-PauseAtEnd`: Mantém o console aberto no final da execução até pressionar ENTER (ideal para atalhos personalizados de rotinas específicas).
+- `-Auto`: Executa a rotina leve de manutenção sem intervenção interativa.
+- `-Advanced`: Executa o diagnóstico avançado completo.
+- `-ExportReport`: Gera o relatório técnico em texto (`SystemReport.txt`).
 - `-HtmlReport`: Gera o dashboard interativo em HTML (`SystemReport.html`).
 - `-InstallTask`: Instala a tarefa semanal no Agendador do Windows.
 - `-RemoveTask`: Remove a tarefa do Agendador do Windows.

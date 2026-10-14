@@ -6,7 +6,9 @@ param(
     [switch]$ExportReport,
     [switch]$HtmlReport,
     [switch]$InstallTask,
-    [switch]$RemoveTask
+    [switch]$RemoveTask,
+    [string]$Routine,
+    [switch]$PauseAtEnd
 )
 
 Set-StrictMode -Version Latest
@@ -23,7 +25,7 @@ try {
 # =========================================================
 
 $script:AppName = 'Windows Maintenance Suite Pro'
-$script:Version = '3.0'
+$script:Version = '3.1'
 $script:StartTime = Get-Date
 
 $script:BasePath = Join-Path $env:USERPROFILE 'Documents\MaintenanceSuite'
@@ -110,6 +112,13 @@ function Write-Log {
 # SEGURANÇA & AUTO-ELEVAÇÃO
 # =========================================================
 
+function Pause-Console {
+    if (-not $Auto) {
+        Write-Host ''
+        Read-Host 'Pressione ENTER para continuar'
+    }
+}
+
 function Test-Administrator {
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -125,7 +134,7 @@ function Test-Administrator {
 }
 
 if (-not (Test-Administrator)) {
-    if ([Environment]::UserInteractive -and -not $Auto) {
+    if ([Environment]::UserInteractive) {
         Write-Host ''
         Write-Host 'Este script requer privilégios de Administrador.' -ForegroundColor Yellow
         Write-Host 'Solicitando elevação via UAC...' -ForegroundColor Cyan
@@ -134,20 +143,34 @@ if (-not (Test-Administrator)) {
             $scriptFile = $MyInvocation.MyCommand.Definition
             if (-not $scriptFile) { $scriptFile = $PSCommandPath }
 
-            $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptFile`""
+            $extraArgs = @()
             if ($PSBoundParameters.Count -gt 0) {
                 foreach ($key in $PSBoundParameters.Keys) {
-                    if ($PSBoundParameters[$key] -eq $true) {
-                        $argList += " -$key"
+                    $val = $PSBoundParameters[$key]
+                    if ($val -is [switch] -and $val.IsPresent) {
+                        $extraArgs += "-$key"
+                    } elseif ($val -is [bool] -and $val) {
+                        $extraArgs += "-$key"
+                    } elseif ($val -is [string] -and $val) {
+                        $extraArgs += "-$key"
+                        $extraArgs += $val
                     }
                 }
             }
+
+            # Use array syntax so PowerShell properly handles paths containing spaces
+            $argList = @(
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", $scriptFile
+            ) + $extraArgs
 
             Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
             exit 0
         }
         catch {
-            Write-Host 'Falha ao solicitar privilégios de Administrador.' -ForegroundColor Red
+            Write-Host "Falha ao solicitar privilégios de Administrador: $_" -ForegroundColor Red
+            Pause-Console
             exit 1
         }
     } else {
@@ -173,13 +196,6 @@ function Format-ByteSize {
         return "$([math]::Round($Bytes / 1KB, 2)) KB"
     } else {
         return "$Bytes Bytes"
-    }
-}
-
-function Pause-Console {
-    if (-not $Auto) {
-        Write-Host ''
-        Read-Host 'Pressione ENTER para continuar'
     }
 }
 
@@ -366,32 +382,37 @@ function Invoke-ConsoleCommand {
 function Test-PendingReboot {
     $reboot = $false
     $reasons = New-Object System.Collections.Generic.List[string]
+    $appPending = New-Object System.Collections.Generic.List[string]
 
-    # Component Based Servicing
+    # Component Based Servicing (Atualização de sistema operacional)
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
         $reboot = $true
         $reasons.Add('Component Based Servicing (Atualização do Windows)')
     }
 
-    # Windows Update
+    # Windows Update (Requer reinício do SO)
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
         $reboot = $true
         $reasons.Add('Windows Update (Reinicialização requerida)')
     }
 
-    # Pending File Rename
+    # Pending File Rename (Verifica se são arquivos do SO ou apenas apps em segundo plano)
     try {
         $rename = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
         if ($null -ne $rename -and $rename.Length -gt 0) {
-            $reboot = $true
-            $reasons.Add('Arquivos de sistema aguardando reinicialização para substituição')
+            if ($reboot) {
+                $reasons.Add('Arquivos de sistema aguardando reinicialização para substituição')
+            } else {
+                $appPending.Add('Arquivos temporários de aplicativos em fila de substituição (OneDrive/Edge)')
+            }
         }
     }
     catch {}
 
     [PSCustomObject]@{
-        IsPending = $reboot
-        Reasons   = @($reasons)
+        IsPending        = $reboot
+        Reasons          = @($reasons)
+        AppPendingRename = @($appPending)
     }
 }
 
@@ -1114,7 +1135,14 @@ function Cleanup-ComponentStore {
 
     Write-Host ''
     Write-Host "DISM Cleanup ExitCode: $exitCode"
-    Write-Host 'Limpeza da pasta WinSxS concluída.' -ForegroundColor Cyan
+    if ($exitCode -eq 0) {
+        Write-Host 'Limpeza da pasta WinSxS concluída com sucesso.' -ForegroundColor Green
+    } elseif ($exitCode -eq 1726) {
+        Write-Host 'Aviso: O Windows encontrou referências a versões antigas já removidas (Erro 1726 - RPC).' -ForegroundColor Yellow
+        Write-Host 'A integridade do sistema não foi afetada. A consolidação ocorrerá no próximo ciclo do Windows Update.' -ForegroundColor DarkGray
+    } else {
+        Write-Host "Limpeza da pasta WinSxS finalizada com código $exitCode." -ForegroundColor Yellow
+    }
 }
 
 # =========================================================
@@ -1657,6 +1685,38 @@ if ($InstallTask) {
 
 if ($RemoveTask) {
     Uninstall-MaintenanceTask
+    exit 0
+}
+
+if ($Routine) {
+    switch ($Routine) {
+        '1'  { Clear-TemporaryFiles }
+        '2'  { Optimize-Drives }
+        '3'  { Clear-NetworkCache }
+        '4'  { Get-SystemSummary; if ($script:LastHealthSummary) { Show-HealthSummary -Health $script:LastHealthSummary } }
+        '5'  { Show-StorageHealth }
+        '6'  { Show-GpuInformation }
+        '7'  { Show-BatteryStatus }
+        '8'  { Show-HeavyProcesses }
+        '9'  { Show-StartupAnalysis }
+        '10' { Show-CriticalEvents }
+        '11' { Export-SystemReport }
+        '12' { Open-WindowsTools }
+        '13' { New-MaintenanceRestorePoint }
+        '14' { Invoke-LightMaintenance }
+        '15' { Invoke-AdvancedDiagnostics }
+        '18' { Repair-WindowsImage }
+        '19' { Cleanup-ComponentStore }
+        default {
+            Write-Host "Rotina '$Routine' não reconhecida. Executando rotina 14 (Manutenção Leve)." -ForegroundColor Yellow
+            Invoke-LightMaintenance
+        }
+    }
+
+    if ($PauseAtEnd) {
+        Write-Host ''
+        Read-Host 'Rotina finalizada. Pressione ENTER para fechar'
+    }
     exit 0
 }
 
