@@ -1,0 +1,7 @@
+# Backup files
+*_backup.ps1
+*.bak
+
+# Temporary / OS files
+*.tmp
+Thumbs.db

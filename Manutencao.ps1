@@ -25,7 +25,7 @@ try {
 # =========================================================
 
 $script:AppName = 'Windows Maintenance Suite Pro'
-$script:Version = '3.1'
+$script:Version = '3.2'
 $script:StartTime = Get-Date
 
 $script:BasePath = Join-Path $env:USERPROFILE 'Documents\MaintenanceSuite'
@@ -792,6 +792,22 @@ function Clear-TemporaryFiles {
         Write-Log 'Falha ao verificar ou limpar lixeira.' 'WARNING'
     }
 
+    # 7. Verificação de Alerta: Pasta WinSxS\Temp (InFlight / PendingDeletes)
+    $winsxsTemp = "$env:SystemRoot\WinSxS\Temp"
+    if (Test-Path $winsxsTemp) {
+        $wsFiles = Get-ChildItem -Path $winsxsTemp -Recurse -File -Force -ErrorAction SilentlyContinue
+        if ($wsFiles) {
+            $wsBytes = ($wsFiles | Measure-Object -Property Length -Sum).Sum
+            $wsGB = [math]::Round($wsBytes / 1GB, 2)
+            if ($wsGB -ge 2.0) {
+                Write-Host ''
+                Write-Host "AVISO: A pasta WinSxS\Temp está acumulando $wsGB GB!" -ForegroundColor Yellow
+                Write-Host 'Recomendação: Execute a opção 19 no menu (Limpeza de Componentes WinSxS).' -ForegroundColor DarkYellow
+                Write-Log "Alerta: Pasta WinSxS\Temp está com $wsGB GB." 'WARNING'
+            }
+        }
+    }
+
     Write-Host ''
     Write-Host "Limpeza concluída! Espaço total liberado: $(Format-ByteSize $totalFreed)" -ForegroundColor Cyan
     Write-Log "Limpeza segura concluída. Espaço liberado: $(Format-ByteSize $totalFreed)" 'INFO'
@@ -1129,20 +1145,195 @@ function Cleanup-ComponentStore {
     Write-Host 'Executando DISM /StartComponentCleanup...' -ForegroundColor Green
     Write-Host 'Isso remove com segurança arquivos substituídos de atualizações antigas.' -ForegroundColor DarkGray
 
+    # Medir tamanho de WinSxS\Temp antes
+    $winsxsTemp = "$env:SystemRoot\WinSxS\Temp"
+    $sizeBefore = 0
+    if (Test-Path $winsxsTemp) {
+        $filesBefore = Get-ChildItem -Path $winsxsTemp -Recurse -File -Force -ErrorAction SilentlyContinue
+        if ($filesBefore) {
+            $sizeBefore = ($filesBefore | Measure-Object -Property Length -Sum).Sum
+        }
+    }
+
     $exitCode = Invoke-ConsoleCommand `
         -FilePath 'DISM.exe' `
         -Arguments @('/Online','/Cleanup-Image','/StartComponentCleanup')
 
     Write-Host ''
     Write-Host "DISM Cleanup ExitCode: $exitCode"
+
+    if (Test-Path $winsxsTemp) {
+        $filesAfter = Get-ChildItem -Path $winsxsTemp -Recurse -File -Force -ErrorAction SilentlyContinue
+        $sizeAfter = if ($filesAfter) { ($filesAfter | Measure-Object -Property Length -Sum).Sum } else { 0 }
+        $freedWinSxS = [math]::Max(0, $sizeBefore - $sizeAfter)
+        if ($freedWinSxS -gt 0) {
+            Write-Host "Espaço liberado em WinSxS\Temp: $(Format-ByteSize $freedWinSxS)" -ForegroundColor DarkGreen
+        }
+    }
+
     if ($exitCode -eq 0) {
         Write-Host 'Limpeza da pasta WinSxS concluída com sucesso.' -ForegroundColor Green
+        Write-Log 'Limpeza de componentes WinSxS concluída com sucesso.' 'INFO'
     } elseif ($exitCode -eq 1726) {
-        Write-Host 'Aviso: O Windows encontrou referências a versões antigas já removidas (Erro 1726 - RPC).' -ForegroundColor Yellow
-        Write-Host 'A integridade do sistema não foi afetada. A consolidação ocorrerá no próximo ciclo do Windows Update.' -ForegroundColor DarkGray
+        Write-Host 'Aviso: Falha na chamada de procedimento remoto (Erro 1726).' -ForegroundColor Yellow
+        Write-Host 'Isso ocorre quando alguma versão antiga registrada no catálogo de atualização está com pasta ausente.' -ForegroundColor Yellow
+        Write-Host 'Dica: Execute a opção 18 (DISM RestoreHealth) para sincronizar o catálogo.' -ForegroundColor Cyan
+        Write-Log 'DISM StartComponentCleanup falhou com código 1726.' 'WARNING'
     } else {
         Write-Host "Limpeza da pasta WinSxS finalizada com código $exitCode." -ForegroundColor Yellow
+        Write-Log "DISM StartComponentCleanup finalizado com código $exitCode." 'WARNING'
     }
+}
+
+function Clear-DriverStore {
+    Show-SectionTitle -Title 'LIMPEZA DE DRIVERS OBSOLETOS (DRIVERSTORE)' -Color Magenta
+
+    # Verificar se o Driver Store Explorer (RAPR) está disponível
+    $rapr = Get-ChildItem -Path "$env:USERPROFILE\Downloads" -Filter "Rapr.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($rapr) {
+        Write-Host "Driver Store Explorer (RAPR) detectado em: $($rapr.FullName)" -ForegroundColor Cyan
+        $choice = Read-Host "Deseja abrir o Driver Store Explorer com interface gráfica? (S/N) [Padrão: S]"
+        if (-not $choice -or $choice -match '^[sS]') {
+            Start-Process -FilePath $rapr.FullName -Verb RunAs
+            Write-Host "Driver Store Explorer iniciado com sucesso." -ForegroundColor Green
+            return
+        }
+    }
+
+    Write-Host 'Verificando pacotes de drivers obsoletos no repositório...' -ForegroundColor Green
+    Write-Host 'Nota: Drivers atualmente em uso por qualquer dispositivo NUNCA são removidos.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $deletedCount = 0
+    $failedCount = 0
+
+    try {
+        $driverList = Get-WindowsDriver -Online -All -ErrorAction Stop |
+                      Where-Object { $_.Driver -match '^oem\d+\.inf$' }
+
+        $grouped = $driverList | Group-Object -Property OriginalFileName, ClassName | Where-Object { $_.Count -gt 1 }
+
+        if (-not $grouped -or $grouped.Count -eq 0) {
+            Write-Host 'Nenhum driver duplicado ou obsoleto encontrado no DriverStore.' -ForegroundColor DarkGreen
+            Write-Log 'DriverStore verificado: nenhum driver obsoleto encontrado.' 'INFO'
+            return
+        }
+
+        Write-Host "Encontrados $($grouped.Count) grupos de drivers com versões múltiplas." -ForegroundColor Yellow
+
+        foreach ($group in $grouped) {
+            $sorted = $group.Group | Sort-Object {
+                if ($_.Date) { [datetime]$_.Date } else { [version]($_.Version -replace '[^\d\.]', '') }
+            }
+
+            # Todos menos a versão mais recente
+            $oldDrivers = $sorted[0..($sorted.Count - 2)]
+
+            foreach ($old in $oldDrivers) {
+                Write-Host "Tentando remover driver obsoleto: $($old.Driver) ($($old.OriginalFileName) v$($old.Version))..." -NoNewline
+
+                $res = pnputil.exe /delete-driver $old.Driver 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host ' [REMOVIDO]' -ForegroundColor Green
+                    Write-Log "Driver obsoleto removido: $($old.Driver) ($($old.OriginalFileName))" 'INFO'
+                    $deletedCount++
+                } else {
+                    Write-Host ' [EM USO / MANTIDO]' -ForegroundColor DarkGray
+                    $failedCount++
+                }
+            }
+        }
+
+        Write-Host ''
+        Write-Host "Concluído: $deletedCount pacote(s) de driver antigo(s) removido(s)." -ForegroundColor Cyan
+        Write-Log "Limpeza de DriverStore concluída. Removidos: $deletedCount, Mantidos: $failedCount" 'INFO'
+    }
+    catch {
+        Write-Host "Aviso ao verificar DriverStore: $_" -ForegroundColor Yellow
+        Write-Log "Falha ao limpar DriverStore: $_" 'WARNING'
+    }
+}
+
+function Show-VirtualDisksAndLargeCaches {
+    Show-SectionTitle -Title 'VARREDURA DE DISCOS VIRTUAIS E GRANDES CACHES' -Color Cyan
+
+    Write-Host 'Analisando discos virtuais (.vhdx), WSL e caches de desenvolvimento...' -ForegroundColor Green
+    Write-Host ''
+
+    $foundLarge = $false
+
+    # 1. Discos VHDX no perfil do usuário (WSL / Hyper-V / Docker)
+    $searchPaths = @(
+        "$env:LOCALAPPDATA\wsl",
+        "$env:LOCALAPPDATA\Packages",
+        "$env:USERPROFILE\.docker",
+        "$env:ProgramData\Microsoft\Windows\Virtual Hard Disks"
+    )
+
+    $vhdxFiles = @()
+    foreach ($sp in $searchPaths) {
+        if (Test-Path $sp) {
+            $found = Get-ChildItem -Path $sp -Filter "*.vhdx" -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue
+            if ($found) { $vhdxFiles += $found }
+        }
+    }
+
+    if ($vhdxFiles -and $vhdxFiles.Count -gt 0) {
+        Write-Host 'Discos Virtuais (.vhdx) Detectados:' -ForegroundColor Yellow
+        foreach ($vhd in ($vhdxFiles | Sort-Object -Property FullName -Unique)) {
+            $sizeGB = [math]::Round($vhd.Length / 1GB, 2)
+            if ($sizeGB -ge 1.0) {
+                $foundLarge = $true
+                Write-Host "  * $($vhd.FullName)" -ForegroundColor White
+                Write-Host "    Tamanho: $sizeGB GB | Última modificação: $($vhd.LastWriteTime.ToString('dd/MM/yyyy HH:mm'))" -ForegroundColor DarkYellow
+            }
+        }
+        Write-Host ''
+    }
+
+    # 2. Verificar pasta WinSxS\Temp
+    $winsxsTemp = "$env:SystemRoot\WinSxS\Temp"
+    if (Test-Path $winsxsTemp) {
+        $tempFiles = Get-ChildItem -Path $winsxsTemp -Recurse -File -Force -ErrorAction SilentlyContinue
+        if ($tempFiles) {
+            $tempBytes = ($tempFiles | Measure-Object -Property Length -Sum).Sum
+            $tempGB = [math]::Round($tempBytes / 1GB, 2)
+            if ($tempGB -ge 2.0) {
+                $foundLarge = $true
+                Write-Host "Aviso: Pasta WinSxS\Temp está acumulando $tempGB GB!" -ForegroundColor Yellow
+                Write-Host "  Caminho: $winsxsTemp" -ForegroundColor White
+                Write-Host "  Recomendação: Execute a opção 19 (Limpeza de Componentes WinSxS) para liberar." -ForegroundColor DarkGray
+                Write-Host ''
+            }
+        }
+    }
+
+    # 3. Caches de ferramentas de desenvolvimento comuns
+    $devCaches = @(
+        @{ Label = 'Cache de Usuário (.cache)'; Path = "$env:USERPROFILE\.cache" },
+        @{ Label = 'Cache do Gradle (.gradle)'; Path = "$env:USERPROFILE\.gradle\caches" },
+        @{ Label = 'Cache do Pip (.pip / pip cache)'; Path = "$env:LOCALAPPDATA\pip\cache" },
+        @{ Label = 'Cache do NPM (npm-cache)'; Path = "$env:APPDATA\npm-cache" }
+    )
+
+    Write-Host 'Status de Caches de Ferramentas / Desenvolvimento:' -ForegroundColor Green
+    foreach ($dc in $devCaches) {
+        if (Test-Path $dc.Path) {
+            $dcFiles = Get-ChildItem -Path $dc.Path -Recurse -File -Force -ErrorAction SilentlyContinue
+            if ($dcFiles) {
+                $dcBytes = ($dcFiles | Measure-Object -Property Length -Sum).Sum
+                $dcMB = [math]::Round($dcBytes / 1MB, 2)
+                if ($dcMB -ge 100) {
+                    Write-Host "  * $($dc.Label): $([math]::Round($dcMB / 1024, 2)) GB ($($dc.Path))" -ForegroundColor White
+                }
+            }
+        }
+    }
+
+    if (-not $foundLarge) {
+        Write-Host 'Nenhum disco virtual ou cache anormalmente grande detectado.' -ForegroundColor DarkGreen
+    }
+    Write-Host ''
 }
 
 # =========================================================
@@ -1186,9 +1377,9 @@ function Install-MaintenanceTask {
     Show-SectionTitle -Title 'CONFIGURAR AGENDAMENTO AUTOMÁTICO'
 
     $taskName = 'WindowsMaintenanceSuite'
-    $scriptFile = $MyInvocation.MyCommand.Definition
-    if (-not $scriptFile) { $scriptFile = $PSCommandPath }
-    if (-not $scriptFile) { $scriptFile = Join-Path $PSScriptRoot 'Manutencao.ps1' }
+    $scriptFile = $PSCommandPath
+    if (-not $scriptFile -and $PSScriptRoot) { $scriptFile = Join-Path $PSScriptRoot 'Manutencao.ps1' }
+    if (-not $scriptFile) { $scriptFile = 'C:\Scripts Manutenção\Manutencao.ps1' }
 
     try {
         $action = New-ScheduledTaskAction `
@@ -1661,6 +1852,7 @@ function Invoke-AdvancedDiagnostics {
     Show-HeavyProcesses
     Show-StartupAnalysis
     Show-CriticalEvents
+    Show-VirtualDisksAndLargeCaches
 
     if ($script:LastHealthSummary) {
         Show-HealthSummary -Health $script:LastHealthSummary
@@ -1707,6 +1899,8 @@ if ($Routine) {
         '15' { Invoke-AdvancedDiagnostics }
         '18' { Repair-WindowsImage }
         '19' { Cleanup-ComponentStore }
+        '20' { Clear-DriverStore }
+        '21' { Show-VirtualDisksAndLargeCaches }
         default {
             Write-Host "Rotina '$Routine' não reconhecida. Executando rotina 14 (Manutenção Leve)." -ForegroundColor Yellow
             Invoke-LightMaintenance
@@ -1769,6 +1963,8 @@ Do {
     Write-Host '--- REPARO PROFUNDO & SISTEMA ---' -ForegroundColor Magenta
     Write-Host '18  Reparo de imagem e integridade (DISM + SFC)'
     Write-Host '19  Limpeza do armazenamento de componentes (WinSxS)'
+    Write-Host '20  Limpeza de drivers obsoletos (DriverStore - GPU/Sistema)'
+    Write-Host '21  Varredura de discos virtuais e grandes caches (.vhdx / WSL)'
     Write-Host ''
     Write-Host '0   Sair'
     Write-Host ''
@@ -1776,9 +1972,9 @@ Do {
     $option = Read-Host 'Escolha uma opção'
 
     switch ($option) {
-        '1'  { Clear-TemporaryFiles;       Pause-Console }
-        '2'  { Optimize-Drives;            Pause-Console }
-        '3'  { Clear-NetworkCache;         Pause-Console }
+        '1'  { Clear-TemporaryFiles;             Pause-Console }
+        '2'  { Optimize-Drives;                  Pause-Console }
+        '3'  { Clear-NetworkCache;               Pause-Console }
         '4'  {
             Get-SystemSummary
             if ($script:LastHealthSummary) {
@@ -1786,21 +1982,23 @@ Do {
             }
             Pause-Console
         }
-        '5'  { Show-StorageHealth;         Pause-Console }
-        '6'  { Show-GpuInformation;        Pause-Console }
-        '7'  { Show-BatteryStatus;         Pause-Console }
-        '8'  { Show-HeavyProcesses;        Pause-Console }
-        '9'  { Show-StartupAnalysis;       Pause-Console }
-        '10' { Show-CriticalEvents;        Pause-Console }
-        '11' { Export-SystemReport;        Pause-Console }
-        '12' { Open-WindowsTools;          Pause-Console }
-        '13' { New-MaintenanceRestorePoint;Pause-Console }
-        '14' { Invoke-LightMaintenance;    Pause-Console }
-        '15' { Invoke-AdvancedDiagnostics; Pause-Console }
-        '16' { Install-MaintenanceTask;    Pause-Console }
-        '17' { Uninstall-MaintenanceTask;  Pause-Console }
-        '18' { Repair-WindowsImage;        Pause-Console }
-        '19' { Cleanup-ComponentStore;     Pause-Console }
+        '5'  { Show-StorageHealth;               Pause-Console }
+        '6'  { Show-GpuInformation;              Pause-Console }
+        '7'  { Show-BatteryStatus;               Pause-Console }
+        '8'  { Show-HeavyProcesses;              Pause-Console }
+        '9'  { Show-StartupAnalysis;             Pause-Console }
+        '10' { Show-CriticalEvents;              Pause-Console }
+        '11' { Export-SystemReport;              Pause-Console }
+        '12' { Open-WindowsTools;                Pause-Console }
+        '13' { New-MaintenanceRestorePoint;      Pause-Console }
+        '14' { Invoke-LightMaintenance;          Pause-Console }
+        '15' { Invoke-AdvancedDiagnostics;       Pause-Console }
+        '16' { Install-MaintenanceTask;          Pause-Console }
+        '17' { Uninstall-MaintenanceTask;        Pause-Console }
+        '18' { Repair-WindowsImage;              Pause-Console }
+        '19' { Cleanup-ComponentStore;           Pause-Console }
+        '20' { Clear-DriverStore;                Pause-Console }
+        '21' { Show-VirtualDisksAndLargeCaches;  Pause-Console }
         '0'  { exit 0 }
         default {
             Write-Host 'Opção inválida.' -ForegroundColor Red

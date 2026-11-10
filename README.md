@@ -1,4 +1,4 @@
-# 🛠️ Windows Maintenance Suite Pro v3.1
+# 🛠️ Windows Maintenance Suite Pro v3.2
 
 Um script de nível Enterprise (SysAdmin) escrito em PowerShell para manutenção, otimização e diagnóstico avançado do Windows 10 e 11.
 
@@ -14,6 +14,7 @@ Diferente da maioria dos "otimizadores" duvidosos da internet, este script possu
 - **Cache do Windows Update:** Limpa a pasta `SoftwareDistribution\Download` (> 7 dias).
 - **Dumps de Travamento & WER:** Remove logs de erro do Windows e relatórios arquivados de crash.
 - **Otimização de Entrega & Lixeira:** Limpeza nativa via API sem gerar falsos avisos quando a lixeira está vazia.
+- **Alerta Proativo de WinSxS\Temp:** Monitora acúmulo excessivo de dados em transição de componentes (> 2 GB) e orienta a execução da limpeza correspondente.
 
 ### ⚡ Otimização de Armazenamento
 - **Detecção Inteligente NVMe / SSD:** Identifica com precisão unidades flash modernas (inclusive SSDs NVMe onde a controladora omite a flag padrão de mídia) e executa exclusivamente o comando nativo **TRIM (`-ReTrim`)**, prevenindo desgaste por desfragmentações desnecessárias.
@@ -25,10 +26,12 @@ Diferente da maioria dos "otimizadores" duvidosos da internet, este script possu
 - **SMART & SSD Health:** Monitora desgaste do SSD e erros de leitura/gravação.
 - **Detecção Inteligente de Reboot Pendente:** Distingue reinicializações reais do sistema operacional (Windows Update / CBS) de filas temporárias de renomeação de aplicativos (OneDrive/Edge), prevenindo falsos descontos na pontuação de saúde.
 
-### 🛡️ Estabilidade, Eventos & Reparo
+### 🛡️ Estabilidade, Eventos & Reparo Profundo
 - **Filtro Unificado de Eventos:** Exclui ruídos cosméticos de DCOM (10005, 10010) e destaca quedas de energia anormais (`Kernel-Power 41`) e telas azuis (`BugCheck 1001`).
 - **Reparo Profundo NATIVO:** Orquestra `DISM /RestoreHealth` e `SFC /scannow` com captura de codificação UTF-16LE corrigida (sem caracteres corrompidos no log).
 - **Limpeza do Armazenamento de Componentes (WinSxS):** Executa `DISM /StartComponentCleanup` para recuperar espaço de atualizações substituídas, com tratamento resiliente para inconsistências de pacotes legados (código 1726/RPC).
+- **Limpeza de Drivers Obsoletos (DriverStore):** Auditoria e remoção de drivers antigos e pacotes duplicados de GPU/sistema.
+- **Varredura de Discos Virtuais & Caches (.vhdx / Dev):** Mapeia discos virtuais (WSL, Hyper-V) e grandes caches de desenvolvimento (`.cache`, `.gradle`, `pip`).
 - **Ponto de Restauração:** Criação de pontos de proteção do sistema diretamente pelo menu.
 - **Codificação UTF-8 com BOM:** Suporte nativo e à prova de falhas a caracteres em Português (PT-BR) no Windows PowerShell 5.1 e superiores.
 
@@ -53,7 +56,7 @@ Você pode automatizar a manutenção semanal de duas formas simples:
    ```
 
 ### ⌨️ Parâmetros de Linha de Comando Suportados:
-- `-Routine <1-19>`: Executa diretamente qualquer rotina do menu (ex: `-Routine 14` para manutenção leve ou `-Routine 15` para diagnóstico avançado).
+- `-Routine <1-21>`: Executa diretamente qualquer rotina do menu (ex: `-Routine 14` para manutenção leve, `-Routine 15` para diagnóstico avançado, `-Routine 20` para DriverStore ou `-Routine 21` para caches de desenvolvimento).
 - `-PauseAtEnd`: Mantém o console aberto no final da execução até pressionar ENTER (ideal para atalhos personalizados de rotinas específicas).
 - `-Auto`: Executa a rotina leve de manutenção sem intervenção interativa.
 - `-Advanced`: Executa o diagnóstico avançado completo.
