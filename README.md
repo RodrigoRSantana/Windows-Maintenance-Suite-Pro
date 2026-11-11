@@ -1,4 +1,4 @@
-# 🛠️ Windows Maintenance Suite Pro v3.2
+# 🛠️ Windows Maintenance Suite Pro v3.3
 
 Um script de nível Enterprise (SysAdmin) escrito em PowerShell para manutenção, otimização e diagnóstico avançado do Windows 10 e 11.
 
@@ -28,7 +28,7 @@ Diferente da maioria dos "otimizadores" duvidosos da internet, este script possu
 
 ### 🛡️ Estabilidade, Eventos & Reparo Profundo
 - **Filtro Unificado de Eventos:** Exclui ruídos cosméticos de DCOM (10005, 10010) e destaca quedas de energia anormais (`Kernel-Power 41`) e telas azuis (`BugCheck 1001`).
-- **Reparo Profundo NATIVO:** Orquestra `DISM /RestoreHealth` e `SFC /scannow` com captura de codificação UTF-16LE corrigida (sem caracteres corrompidos no log).
+- **Reparo Profundo NATIVO (Progresso ao Vivo):** Orquestra `DISM /RestoreHealth` e `SFC /scannow` com progresso nativo exibido em tempo real no console interativo (sem bufferização oculta), medição de duração e extração automática do resumo `[SR]` do `CBS.log` para o log sem poluição de barras de porcentagem.
 - **Limpeza do Armazenamento de Componentes (WinSxS):** Executa `DISM /StartComponentCleanup` para recuperar espaço de atualizações substituídas, com tratamento resiliente para inconsistências de pacotes legados (código 1726/RPC).
 - **Limpeza de Drivers Obsoletos (DriverStore):** Auditoria e remoção de drivers antigos e pacotes duplicados de GPU/sistema.
 - **Varredura de Discos Virtuais & Caches (.vhdx / Dev):** Mapeia discos virtuais (WSL, Hyper-V) e grandes caches de desenvolvimento (`.cache`, `.gradle`, `pip`).

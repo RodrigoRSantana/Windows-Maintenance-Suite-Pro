@@ -25,7 +25,7 @@ try {
 # =========================================================
 
 $script:AppName = 'Windows Maintenance Suite Pro'
-$script:Version = '3.2'
+$script:Version = '3.3'
 $script:StartTime = Get-Date
 
 $script:BasePath = Join-Path $env:USERPROFILE 'Documents\MaintenanceSuite'
@@ -266,28 +266,45 @@ function Read-ProcessOutputFile {
         $bytes = [System.IO.File]::ReadAllBytes($Path)
         if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
 
+        $rawText = ''
+
         # UTF-16LE com BOM (FF FE) ou sem BOM (comum no sfc.exe com bytes nulos intermediários)
         $isUtf16Le = ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
                      ($bytes.Length -ge 4 -and $bytes[1] -eq 0x00 -and $bytes[3] -eq 0x00)
 
         if ($isUtf16Le) {
-            return [System.Text.Encoding]::Unicode.GetString($bytes) -split "\r?\n"
+            $rawText = [System.Text.Encoding]::Unicode.GetString($bytes)
         }
-
         # UTF-8 com BOM (EF BB BF)
-        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-            return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) -split "\r?\n"
+        elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $rawText = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+        }
+        else {
+            # UTF-8 estrito ou fallback para o OEM da máquina
+            try {
+                $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+                $rawText = $utf8Strict.GetString($bytes)
+            }
+            catch {
+                $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+                $rawText = [System.Text.Encoding]::GetEncoding($oemCodePage).GetString($bytes)
+            }
         }
 
-        # UTF-8 estrito ou fallback para o OEM da máquina
-        try {
-            $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
-            return $utf8Strict.GetString($bytes) -split "\r?\n"
+        # Quebra por linha e colapsa sobrescritas via \r (barras de progresso)
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($segment in ($rawText -split "\r?\n")) {
+            if ($segment -match "\r") {
+                $parts = @($segment -split "\r" | Where-Object { $_.Trim() -ne '' })
+                if ($parts.Count -gt 0) {
+                    $lines.Add($parts[-1])
+                }
+            } else {
+                $lines.Add($segment)
+            }
         }
-        catch {
-            $oemCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-            return [System.Text.Encoding]::GetEncoding($oemCodePage).GetString($bytes) -split "\r?\n"
-        }
+
+        return @($lines)
     }
     catch {
         return @()
@@ -324,8 +341,53 @@ function Invoke-SafeCommand {
 }
 
 # ----------------------------------------------------------
+# Helpers para saída em tempo real e logs limpos (DISM/SFC)
+# ----------------------------------------------------------
+function Test-IsProgressSpamLine {
+    param([string]$Text)
+
+    if ($Text -match '^\s*\[[=\s\d\.,%]+\]\s*$') {
+        return ($Text -notmatch '100\.0%')
+    }
+
+    if ($Text -match '^\s*(?:Verificação|Verification)\s+(\d+)%\s+(?:concluída|complete)\.?\s*$') {
+        return ([int]$Matches[1] -lt 100)
+    }
+
+    return $false
+}
+
+function Write-SfcLogSummary {
+    param(
+        [datetime]$Since,
+        [int]$ExitCode
+    )
+
+    Write-Log "SFC /scannow finalizado com ExitCode: $ExitCode" -Silent
+
+    try {
+        $cbsPath = "$env:SystemRoot\Logs\CBS\cbs.log"
+        if (Test-Path $cbsPath) {
+            $sinceStr = $Since.ToString('yyyy-MM-dd HH:mm:ss')
+            $srLines = @(Get-Content -Path $cbsPath -Tail 500 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '\[SR\]' -and $_ -notmatch 'Verifying \d+ components|Beginning Verify|Verify complete' })
+
+            foreach ($item in $srLines) {
+                if ($item -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?\[SR\]\s+(.+)$') {
+                    if ($Matches[1] -ge $sinceStr) {
+                        Write-Log "CBS [SR]: $($Matches[2])" -Silent
+                    }
+                }
+            }
+        }
+    }
+    catch {}
+}
+
+# ----------------------------------------------------------
 # Invoke-ConsoleCommand
-# Uso específico para DISM e SFC com decodificação resiliente.
+# Executa DISM/SFC com progresso ao vivo no console interativo
+# ou com captura decodificada no modo automatizado/redirecionado.
 # ----------------------------------------------------------
 function Invoke-ConsoleCommand {
     param(
@@ -334,6 +396,41 @@ function Invoke-ConsoleCommand {
 
         [string[]]$Arguments = @()
     )
+
+    $isLiveConsole = $false
+    try {
+        $isLiveConsole = (-not $Auto) -and [Environment]::UserInteractive -and (-not [Console]::IsOutputRedirected)
+    } catch {}
+
+    $cmdStart = Get-Date
+
+    if ($isLiveConsole) {
+        try {
+            Write-Log "Iniciando comando interativo: $FilePath $($Arguments -join ' ')" -Silent
+
+            $process = Start-Process `
+                -FilePath $FilePath `
+                -ArgumentList $Arguments `
+                -Wait `
+                -NoNewWindow `
+                -PassThru
+
+            $elapsed = (Get-Date) - $cmdStart
+            $elapsedStr = '{0:hh\:mm\:ss}' -f $elapsed
+
+            if ($FilePath -match 'sfc') {
+                Write-SfcLogSummary -Since $cmdStart -ExitCode $process.ExitCode
+            } else {
+                Write-Log "Comando finalizado ($FilePath) em $elapsedStr | ExitCode: $($process.ExitCode)" -Silent
+            }
+
+            return $process.ExitCode
+        }
+        catch {
+            Write-Log "Falha ao executar $FilePath : $_" 'ERROR'
+            return -1
+        }
+    }
 
     $tmpOut = [System.IO.Path]::GetTempFileName()
     $tmpErr = [System.IO.Path]::GetTempFileName()
@@ -348,10 +445,10 @@ function Invoke-ConsoleCommand {
             -RedirectStandardOutput $tmpOut `
             -RedirectStandardError  $tmpErr
 
-        # Exibe e grava no log cada linha do stdout decodificada corretamente
+        # Exibe e grava no log cada linha relevante do stdout decodificada corretamente
         foreach ($line in (Read-ProcessOutputFile -Path $tmpOut)) {
             $text = $line.TrimEnd()
-            if ($text -ne '') {
+            if ($text -ne '' -and -not (Test-IsProgressSpamLine -Text $text)) {
                 Write-Log $text
             }
         }
@@ -1119,21 +1216,29 @@ function Repair-WindowsImage {
     Show-SectionTitle -Title 'REPARO PROFUNDO WINDOWS (DISM + SFC)' -Color Magenta
 
     Write-Host '1/2 Executando DISM /RestoreHealth (pode demorar)...' -ForegroundColor Green
+    Write-Host 'O progresso nativo será exibido abaixo em tempo real.' -ForegroundColor DarkGray
+    $swDism = [System.Diagnostics.Stopwatch]::StartNew()
     $dismExit = Invoke-ConsoleCommand `
         -FilePath 'DISM.exe' `
         -Arguments @('/Online','/Cleanup-Image','/RestoreHealth')
+    $swDism.Stop()
 
     Write-Host ''
-    Write-Host "DISM ExitCode: $dismExit"
+    $dismColor = if ($dismExit -eq 0) { 'DarkGreen' } else { 'Yellow' }
+    Write-Host "DISM ExitCode: $dismExit (Duração: $($swDism.Elapsed.ToString('hh\:mm\:ss')))" -ForegroundColor $dismColor
 
     Write-Host ''
-    Write-Host '2/2 Executando SFC /scannow (pode demorar)...' -ForegroundColor Green
+    Write-Host '2/2 Executando SFC /scannow (pode demorar em compilações recentes do Win11)...' -ForegroundColor Green
+    Write-Host 'O progresso nativo será exibido abaixo em tempo real.' -ForegroundColor DarkGray
+    $swSfc = [System.Diagnostics.Stopwatch]::StartNew()
     $sfcExit = Invoke-ConsoleCommand `
         -FilePath 'sfc.exe' `
         -Arguments @('/scannow')
+    $swSfc.Stop()
 
     Write-Host ''
-    Write-Host "SFC ExitCode: $sfcExit"
+    $sfcColor = if ($sfcExit -eq 0) { 'DarkGreen' } else { 'Yellow' }
+    Write-Host "SFC ExitCode: $sfcExit (Duração: $($swSfc.Elapsed.ToString('hh\:mm\:ss')))" -ForegroundColor $sfcColor
 
     Write-Host ''
     Write-Host 'Reparo concluído.' -ForegroundColor Cyan
@@ -1155,12 +1260,14 @@ function Cleanup-ComponentStore {
         }
     }
 
+    $swCleanup = [System.Diagnostics.Stopwatch]::StartNew()
     $exitCode = Invoke-ConsoleCommand `
         -FilePath 'DISM.exe' `
         -Arguments @('/Online','/Cleanup-Image','/StartComponentCleanup')
+    $swCleanup.Stop()
 
     Write-Host ''
-    Write-Host "DISM Cleanup ExitCode: $exitCode"
+    Write-Host "DISM Cleanup ExitCode: $exitCode (Duração: $($swCleanup.Elapsed.ToString('hh\:mm\:ss')))"
 
     if (Test-Path $winsxsTemp) {
         $filesAfter = Get-ChildItem -Path $winsxsTemp -Recurse -File -Force -ErrorAction SilentlyContinue
